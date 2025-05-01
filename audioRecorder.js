@@ -1,214 +1,179 @@
+const ffmpeg = require('fluent-ffmpeg');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const { EventEmitter } = require('events');
 
-class AudioRecorder {
-    constructor() {
-        this.recordingProcess = null;
+class AudioRecorder extends EventEmitter {
+    constructor(settings) {
+        super();
         this.isRecording = false;
-        this.currentOutputPath = null;
-
-        // Default audio processing parameters
-        this.defaultFilterOptions = {
-            // Noise reduction parameters (afftdn filter)
-            noiseReduction: {
-                enabled: true,
-                nr: 10,        // Noise reduction level (0-97, default 10)
-                nf: -25,       // Noise floor (dB, default -25)
-                nt: 'w',       // Noise type (w=white, v=vinyl, default 'w')
-            },
-            // Loudness normalization parameters (loudnorm filter)
-            loudnessNorm: {
-                enabled: true,
-                targetLevel: -16,      // LUFS target level (default -16)
-                truePeak: -1.5,        // dBTP target (default -1.5)
-                windowSize: 0.4,       // Sliding window in seconds (default 0.4)
-            },
-            // Dynamic range compression parameters (compand filter)
-            compression: {
-                enabled: false,  // Disabled by default as loudnorm is preferred
-                threshold: -20,    // dB threshold
-                ratio: 3,         // Compression ratio
-                attack: 0.1,      // Attack time in seconds
-                release: 0.2,     // Release time in seconds
-            },
-            // Voice activity detection (silencedetect filter)
-            vad: {
-                enabled: false,  // Disabled by default
-                threshold: -30,  // Noise threshold in dB
-                duration: 0.5,   // Minimum silence duration in seconds
-            }
+        this.process = null;
+        this.audioBuffer = new Float32Array(1024);
+        this.settings = {
+            inputDevice: settings.inputDevice || { type: 'system', index: 0 }
         };
+        this.levelDetector = new LevelDetector();
+        this.outputFilePath = null;
+
+        // Check FFmpeg availability
+        this.checkFFmpeg().catch(error => {
+            console.error('FFmpeg check failed:', error);
+            this.emit('error', error);
+        });
+    }
+
+    async checkFFmpeg() {
+        return new Promise((resolve, reject) => {
+            const process = spawn('ffmpeg', ['-version']);
+            
+            let output = '';
+            process.stdout.on('data', (data) => {
+                output += data.toString();
+            });
+
+            process.stderr.on('data', (data) => {
+                console.error('FFmpeg check stderr:', data.toString());
+            });
+
+            process.on('error', (error) => {
+                if (error.code === 'ENOENT') {
+                    reject(new Error('FFmpeg is not installed. Please install FFmpeg to use audio recording.'));
+                } else {
+                    reject(error);
+                }
+            });
+
+            process.on('close', (code) => {
+                if (code === 0) {
+                    console.log('FFmpeg version:', output.split('\n')[0]);
+                    resolve();
+                } else {
+                    reject(new Error(`FFmpeg check failed with code ${code}`));
+                }
+            });
+        });
     }
 
     /**
-     * Start recording from the macOS microphone with audio processing
-     * @param {string} outputFilePath - Full path where the WAV file should be saved
-     * @param {Object} [options] - Optional configuration
-     * @param {number} [options.deviceIndex] - Specific microphone index (optional, uses default if not specified)
-     * @param {number} [options.sampleRate=16000] - Audio sample rate in Hz
-     * @param {Object} [options.filters] - Audio processing filter options
-     * @param {Object} [options.filters.noiseReduction] - Noise reduction settings
-     * @param {boolean} [options.filters.noiseReduction.enabled] - Enable/disable noise reduction
-     * @param {number} [options.filters.noiseReduction.nr] - Noise reduction level (0-97)
-     * @param {number} [options.filters.noiseReduction.nf] - Noise floor (dB)
-     * @param {Object} [options.filters.loudnessNorm] - Loudness normalization settings
-     * @param {boolean} [options.filters.loudnessNorm.enabled] - Enable/disable loudness normalization
-     * @param {number} [options.filters.loudnessNorm.targetLevel] - Target loudness level (LUFS)
-     * @param {number} [options.filters.loudnessNorm.truePeak] - True peak target (dBTP)
+     * Start recording from the macOS microphone
+     * @param {string} outputFilePath - Full path where the audio file should be saved
      * @returns {Promise<void>} Resolves when recording starts, rejects on error
      */
-    startRecording(outputFilePath, options = {}) {
+    async startRecording(outputFilePath) {
         if (this.isRecording) {
             return Promise.reject(new Error('Recording already in progress'));
         }
+
+        if (!outputFilePath) {
+            return Promise.reject(new Error('Output file path is required'));
+        }
+
+        this.outputFilePath = outputFilePath;
 
         if (process.platform !== 'darwin') {
             return Promise.reject(new Error('This recorder currently only supports macOS'));
         }
 
-        // Merge provided filter options with defaults
-        const filterOptions = {
-            ...this.defaultFilterOptions,
-            ...(options.filters || {}),
-            noiseReduction: {
-                ...this.defaultFilterOptions.noiseReduction,
-                ...(options.filters?.noiseReduction || {})
-            },
-            loudnessNorm: {
-                ...this.defaultFilterOptions.loudnessNorm,
-                ...(options.filters?.loudnessNorm || {})
-            },
-            compression: {
-                ...this.defaultFilterOptions.compression,
-                ...(options.filters?.compression || {})
-            },
-            vad: {
-                ...this.defaultFilterOptions.vad,
-                ...(options.filters?.vad || {})
-            }
-        };
+        const inputDevice = this.settings.inputDevice;
 
-        return new Promise((resolve, reject) => {
-            try {
-                this.currentOutputPath = outputFilePath;
-
-                // Delete existing output file if it exists
-                if (fs.existsSync(outputFilePath)) {
-                    fs.unlinkSync(outputFilePath);
-                }
-
-                // Prepare FFmpeg arguments for macOS microphone recording
+        // Build FFmpeg command for visualization
                 const args = [
-                    '-f', 'avfoundation',    // Use AVFoundation for capture
-                    '-thread_queue_size', '4096'  // Prevent buffer underrun
-                ];
+            '-f', 'avfoundation',
+            '-i', inputDevice.type === 'system' ? ':0' : `:${inputDevice.index}`,
+            '-acodec', 'pcm_s16le',
+            '-ar', '16000',
+            '-ac', '1',
+            '-f', 's16le',
+            'pipe:1'
+        ];
 
-                // Configure input device
-                const deviceInput = options.deviceIndex !== undefined ? 
-                    `none:${options.deviceIndex}` : 'none:0';  // Format: none:audio_idx
-                args.push('-i', deviceInput);
+        console.log('Starting FFmpeg visualization process with args:', args.join(' '));
 
-                // Build the filter chain
-                let filterChain = [];
+        // Start FFmpeg process for visualization
+        this.process = spawn('ffmpeg', args);
 
-                // 1. Noise Reduction Filter
-                if (filterOptions.noiseReduction.enabled) {
-                    filterChain.push(
-                        `afftdn=` +
-                        `nr=${filterOptions.noiseReduction.nr}:` +
-                        `nf=${filterOptions.noiseReduction.nf}:` +
-                        `nt=${filterOptions.noiseReduction.nt}`
-                    );
-                }
+        // Handle process errors
+        this.process.on('error', (error) => {
+            console.error('FFmpeg visualization process error:', error);
+            this.emit('error', error);
+        });
 
-                // 2. Loudness Normalization
-                if (filterOptions.loudnessNorm.enabled) {
-                    filterChain.push(
-                        `loudnorm=` +
-                        `I=${filterOptions.loudnessNorm.targetLevel}:` +
-                        `TP=${filterOptions.loudnessNorm.truePeak}:` +
-                        `linear=true:` +
-                        `dual_mono=true`
-                    );
-                }
-                // Alternative: Dynamic Range Compression
-                else if (filterOptions.compression.enabled) {
-                    filterChain.push(
-                        `compand=` +
-                        `attacks=${filterOptions.compression.attack}:` +
-                        `decays=${filterOptions.compression.release}:` +
-                        `points=-${Math.abs(filterOptions.compression.threshold)}/` +
-                        `-${Math.abs(filterOptions.compression.threshold)}|` +
-                        `0/${-Math.abs(filterOptions.compression.threshold/filterOptions.compression.ratio)}`
-                    );
-                }
+        // Log stderr for debugging
+        this.process.stderr.on('data', (data) => {
+            console.log('FFmpeg visualization stderr:', data.toString());
+        });
 
-                // 3. Optional: Voice Activity Detection (logging only)
-                if (filterOptions.vad.enabled) {
-                    filterChain.push(
-                        `silencedetect=` +
-                        `n=${filterOptions.vad.threshold}dB:` +
-                        `d=${filterOptions.vad.duration}`
-                    );
-                }
-
-                // Add the filter chain if any filters are enabled
-                if (filterChain.length > 0) {
-                    args.push('-af', filterChain.join(','));
-                }
-
-                // Add output settings
-                args.push(
-                    '-ar', String(options.sampleRate || 16000),  // Sample rate (default 16kHz)
-                    '-acodec', 'pcm_s16le',    // 16-bit PCM
-                    '-ac', '1',                // Mono recording
-                    '-f', 'wav',               // WAV format
-                    outputFilePath
-                );
-
-                // Start FFmpeg process
-                this.recordingProcess = spawn('ffmpeg', args);
-
-                // Handle process events
-                this.recordingProcess.stderr.on('data', (data) => {
-                    const output = data.toString();
-                    console.log('FFmpeg:', output);
-                    
-                    // Check for successful input initialization
-                    if (output.includes('Input #0')) {
-                        this.isRecording = true;
-                        resolve();
-                    }
-
-                    // Log silence detection if enabled
-                    if (filterOptions.vad.enabled && 
-                        (output.includes('silence_start') || output.includes('silence_end'))) {
-                        console.log('VAD:', output.trim());
-                    }
-                });
-
-                this.recordingProcess.on('error', (error) => {
-                    console.error('FFmpeg process error:', error);
-                    this.isRecording = false;
-                    this.recordingProcess = null;
-                    reject(error);
-                });
-
-                // Set a timeout for initialization
-                setTimeout(() => {
-                    if (!this.isRecording) {
-                        this.recordingProcess?.kill();
-                        reject(new Error('Failed to start recording within timeout'));
-                    }
-                }, 3000);
-
-            } catch (error) {
-                console.error('Error setting up FFmpeg:', error);
-                this.isRecording = false;
-                this.recordingProcess = null;
-                reject(error);
+        // Handle audio data for visualization
+        this.process.stdout.on('data', (data) => {
+            // Convert buffer to Float32Array for visualization
+            const samples = new Float32Array(data.length / 2);
+            for (let i = 0; i < samples.length; i++) {
+                samples[i] = data.readInt16LE(i * 2) / 32768.0;
             }
+            
+            // Calculate audio level
+            const level = this.levelDetector.processChunk(samples);
+            
+            // Update audio buffer for waveform
+            this.updateAudioBuffer(samples);
+            
+            // Emit audio visualization data
+            this.emit('audioData', {
+                level,
+                waveform: Array.from(this.audioBuffer)
+            });
+        });
+
+        // Start recording to file with same settings
+        const outputArgs = [
+            '-y',  // Force overwrite
+            '-f', 'avfoundation',
+            '-i', inputDevice.type === 'system' ? ':0' : `:${inputDevice.index}`,
+            '-acodec', 'pcm_s16le',
+            '-ar', '16000',
+            '-ac', '1',
+            '-f', 'wav',
+                    outputFilePath
+        ];
+
+        console.log('Starting FFmpeg recording process with args:', outputArgs.join(' '));
+
+        // Start recording process
+        this.outputProcess = spawn('ffmpeg', outputArgs);
+
+        // Handle recording process errors
+        this.outputProcess.on('error', (error) => {
+            console.error('FFmpeg recording process error:', error);
+            this.emit('error', error);
+        });
+
+        // Log stderr for debugging
+        this.outputProcess.stderr.on('data', (data) => {
+            console.log('FFmpeg recording stderr:', data.toString());
+        });
+
+        this.isRecording = true;
+        return new Promise((resolve, reject) => {
+            // Wait for first data or error
+            const timeout = setTimeout(() => {
+                reject(new Error('FFmpeg process failed to start recording within 5 seconds'));
+            }, 5000);
+
+            const onData = () => {
+                clearTimeout(timeout);
+                this.process.stdout.removeListener('data', onData);
+                resolve();
+            };
+
+            const onError = (error) => {
+                clearTimeout(timeout);
+                this.process.removeListener('error', onError);
+                reject(error);
+            };
+
+            this.process.stdout.once('data', onData);
+            this.process.once('error', onError);
         });
     }
 
@@ -217,36 +182,76 @@ class AudioRecorder {
      * @returns {Promise<string>} Resolves with the output file path before clearing it
      */
     async stopRecording() {
-        if (!this.isRecording || !this.recordingProcess) {
+        if (!this.isRecording) {
             return Promise.reject(new Error('No active recording to stop'));
         }
 
-        const outputPath = this.currentOutputPath; // Store the path before clearing it
+        if (!this.outputFilePath) {
+            return Promise.reject(new Error('No output file path set'));
+        }
 
-        return new Promise((resolve, reject) => {
-            try {
-                // Set up exit handler
-                this.recordingProcess.on('exit', (code) => {
+        const outputPath = this.outputFilePath;
+        console.log('Stopping recording, output path:', outputPath);
+
+        // Stop both processes and wait for them to exit
+        await Promise.all([
+            new Promise((resolve, reject) => {
+                if (this.process) {
+                    console.log('Stopping visualization process...');
+                    this.process.on('exit', () => {
+                        console.log('Visualization process exited');
+                        resolve();
+                    });
+                    this.process.kill('SIGTERM');
+                } else {
+                    resolve();
+                }
+            }),
+            new Promise((resolve, reject) => {
+                if (this.outputProcess) {
+                    console.log('Stopping recording process...');
+                    this.outputProcess.on('exit', () => {
+                        console.log('Recording process exited');
+                        resolve();
+                    });
+                    this.outputProcess.kill('SIGTERM');
+                } else {
+                    resolve();
+                }
+            })
+        ]);
+
+        // Clear the processes
+        this.process = null;
+        this.outputProcess = null;
                     this.isRecording = false;
-                    this.recordingProcess = null;
-                    this.currentOutputPath = null;
-                    
-                    if (code === 0 || code === 255) { // 255 is often returned on SIGTERM
-                        resolve(outputPath); // Return the stored path
+
+        // Wait for the file to be fully written
+        await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                reject(new Error('Timeout waiting for file to be written'));
+            }, 5000);
+
+            const checkFile = async () => {
+                try {
+                    const stats = await fs.promises.stat(outputPath);
+                    if (stats.size > 0) {
+                        clearTimeout(timeout);
+                        resolve();
                     } else {
-                        reject(new Error(`FFmpeg exited with code ${code}`));
+                        setTimeout(checkFile, 100);
                     }
-                });
-
-                // Send SIGTERM to FFmpeg for graceful shutdown
-                this.recordingProcess.kill('SIGTERM');
-
             } catch (error) {
-                console.error('Error stopping FFmpeg:', error);
-                this.isRecording = false;
-                this.recordingProcess = null;
+                    if (error.code === 'ENOENT') {
+                        setTimeout(checkFile, 100);
+                    } else {
+                        clearTimeout(timeout);
                 reject(error);
             }
+                }
+            };
+
+            checkFile();
         });
     }
 
@@ -260,42 +265,36 @@ class AudioRecorder {
         }
 
         return new Promise((resolve, reject) => {
-            const ffmpeg = spawn('ffmpeg', ['-f', 'avfoundation', '-list_devices', 'true', '-i', '""']);
-            let output = '';
+            ffmpeg.getAvailableFormats((err, formats) => {
+                if (err) {
+                    reject(err);
+                    return;
+                }
 
-            ffmpeg.stderr.on('data', (data) => {
-                output += data.toString();
-            });
+                // On macOS, list avfoundation devices
+                const process = spawn('ffmpeg', ['-f', 'avfoundation', '-list_devices', 'true', '-i', '']);
+                let devices = [];
 
-            ffmpeg.on('error', (error) => {
-                reject(error);
-            });
-
-            ffmpeg.on('exit', () => {
-                try {
-                    const devices = [];
-                    const lines = output.split('\n');
-                    let isAudioSection = false;
-
-                    for (const line of lines) {
-                        if (line.includes('AVFoundation audio devices:')) {
-                            isAudioSection = true;
-                            continue;
-                        }
-                        if (isAudioSection && line.match(/\[\d+\]/)) {
-                            const match = line.match(/\[(\d+)\]\s+(.*?)$/);
-                            if (match) {
+                process.stderr.on('data', (data) => {
+                    const lines = data.toString().split('\n');
+                    lines.forEach(line => {
+                        const match = line.match(/\[AVFoundation input device @ (.*)\] \[(.*)\] (.*)/);
+                        if (match && match[2] === 'input') {
                                 devices.push({
-                                    index: parseInt(match[1], 10),
-                                    name: match[2].trim()
+                                index: devices.length,
+                                name: match[3].trim()
                                 });
                             }
-                        }
-                    }
+                    });
+                });
+
+                process.on('close', () => {
                     resolve(devices);
-                } catch (error) {
-                    reject(new Error('Failed to parse device list: ' + error.message));
-                }
+                });
+
+                process.on('error', (error) => {
+                    reject(error);
+                });
             });
         });
     }
@@ -313,7 +312,77 @@ class AudioRecorder {
      * @returns {string|null} Current output file path or null if not recording
      */
     getCurrentOutputPath() {
-        return this.currentOutputPath;
+        return this.settings.outputFilePath;
+    }
+
+    // Get current audio data for visualization
+    getAudioData() {
+        return Array.from(this.audioBuffer);
+    }
+
+    // Utility function to downsample audio data
+    downsample(data, targetLength) {
+        const step = data.length / targetLength;
+        const result = new Float32Array(targetLength);
+        
+        for (let i = 0; i < targetLength; i++) {
+            const pos = Math.floor(i * step);
+            result[i] = data[pos];
+        }
+        
+        return result;
+    }
+
+    updateAudioBuffer(newSamples) {
+        // Shift existing samples left
+        this.audioBuffer.copyWithin(0, newSamples.length);
+        
+        // Add new samples at the end
+        this.audioBuffer.set(
+            newSamples.subarray(0, Math.min(newSamples.length, this.audioBuffer.length)),
+            this.audioBuffer.length - Math.min(newSamples.length, this.audioBuffer.length)
+        );
+    }
+
+    updateSettings(newSettings) {
+        this.settings = newSettings;
+        
+        // If recording, restart with new settings
+        if (this.isRecording) {
+            const wasRecording = this.isRecording;
+            this.stopRecording().then(() => {
+                if (wasRecording) {
+                    this.startRecording();
+                }
+            });
+        }
+    }
+}
+
+// Helper class for audio level detection
+class LevelDetector {
+    constructor() {
+        this.smoothingFactor = 0.95;
+        this.currentLevel = -Infinity;
+    }
+
+    processChunk(samples) {
+        // Calculate RMS of the chunk
+        const sum = samples.reduce((acc, sample) => acc + (sample * sample), 0);
+        const rms = Math.sqrt(sum / samples.length);
+        
+        // Convert to dB
+        const db = 20 * Math.log10(Math.max(rms, 1e-10));
+        
+        // Smooth the level
+        if (this.currentLevel === -Infinity) {
+            this.currentLevel = db;
+        } else {
+            this.currentLevel = this.smoothingFactor * this.currentLevel +
+                              (1 - this.smoothingFactor) * db;
+        }
+        
+        return this.currentLevel;
     }
 }
 

@@ -353,124 +353,107 @@ try {
 
 ### Edge Function: transcribe-audio
 
-Request Parameters:
+Request Format:
 ```typescript
 interface TranscribeAudioRequest {
   audioData: string;        // Base64 encoded audio data
   meetingId: string;        // UUID of the meeting
-  languageCode: string;     // e.g., 'en_us', 'es_es'
-  features: string[];       // ['sentiment_analysis', 'auto_highlights', 'iab_categories']
+  languageCode?: string;    // Optional: e.g., 'en_us' (defaults to 'en_us')
+  features?: string[];      // Optional: ['sentiment_analysis', 'entity_detection', 'summarization']
 }
 ```
 
 Response Format:
 ```typescript
-interface TranscribeAudioResponse {
-  success: boolean;
-  data?: {
-    transcription: {
-      text: string;
-      segments: Array<{
-        text: string;
-        start: number;
-        end: number;
-        confidence: number;
-      }>;
+interface ProcessedTranscription {
+  id: string;              // AssemblyAI transcript ID
+  text: string;            // Full transcription text
+  utterances: Array<{      // Speaker-separated segments
+    id: string;            // Unique utterance ID
+    text: string;          // Utterance text
+    speaker: {
+      id: string;          // Speaker identifier
+      name: string;        // Speaker label (e.g., "Speaker 1")
     };
-    sentiment_analysis?: {
-      overall_sentiment: 'positive' | 'negative' | 'neutral';
-      segments: Array<{
-        text: string;
-        sentiment: string;
-        confidence: number;
-      }>;
-    };
-  };
-  error?: {
-    code: string;
-    message: string;
-    details?: any;
-  };
+    timestamp: string;     // ISO timestamp
+    confidence: number;    // Confidence score
+  }>;
+  sentimentAnalysis: Array<{
+    text: string;          // Text segment
+    sentiment: 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL';
+    confidence: number;    // Confidence score
+  }>;
+  topics: Array<{
+    topic: string;         // Detected topic
+    confidence: number;    // Confidence score
+  }>;
+  keyPhrases: Array<{
+    phrase: string;        // Key phrase
+    count: number;         // Occurrence count
+    rank: number;         // Importance ranking
+  }>;
 }
 ```
 
-Rate Limits:
-- Maximum audio file size: 100MB
-- Maximum audio duration: 4 hours
-- Concurrent transcriptions per workspace: 5
-- API calls per minute: 60
-
-### Token Authentication
-
-Token Format:
-- 32-byte random hex string
-- Example: `a5c6a2cf88ac0588a198521df4a7813cac4f11b44d85417171d8a9e1cb6176bd`
-
-Error Responses:
+Error Response Format:
 ```typescript
-interface TokenError {
-  error: {
-    message: string;    // Error description
-    code: string;       // Error code
-  };
+{
+  error: string;           // Error message
+  timestamp: string;       // ISO timestamp of error
 }
-
-// Error Codes
-const TOKEN_ERRORS = {
-  INVALID_TOKEN: 'token/invalid',        // Token doesn't exist
-  EXPIRED_TOKEN: 'token/expired',        // Token has expired
-  USED_TOKEN: 'token/already-used',      // Token was already used
-  USER_MISMATCH: 'token/user-mismatch',  // Token belongs to different user
-  MISSING_TOKEN: 'token/missing'         // No token provided
-};
 ```
 
-### Realtime Subscriptions
+Important Notes:
+1. **Authentication**
+   - Requires valid Supabase authentication token in Authorization header
+   - Returns 401 for unauthorized requests
 
-Configuration:
+2. **Audio Requirements**
+   - Base64 encoded audio data
+   - Supported formats: WAV, MP3, WebM
+   - Maximum processing time: 5 minutes
+   - Audio data is validated before processing
+
+3. **Database Updates**
+   The function automatically updates the following fields in the meetings table:
+   - transcription: Array of utterances with speaker identification
+   - sentiment_analysis: Sentiment analysis results
+   - topics: Detected topics
+   - key_phrases: Important phrases and their rankings
+   - updated_at: Timestamp of the update
+
+4. **Processing Steps**
+   - Validates request and authentication
+   - Decodes and uploads audio to AssemblyAI
+   - Initiates transcription with selected features
+   - Polls for completion (max 5 minutes)
+   - Processes and structures the response
+   - Updates database
+   - Returns processed results
+
+5. **Rate Limits**
+   - Maximum audio file size: Check AssemblyAI plan limits
+   - Concurrent processing: Based on AssemblyAI plan
+   - Processing timeout: 5 minutes
+
+Example Usage:
 ```typescript
-const REALTIME_CONFIG = {
-  timeout: 10000,           // Reconnection timeout (ms)
-  retryInterval: 1000,      // Time between retries (ms)
-  maxRetries: 5,           // Maximum retry attempts
-  retryBackoff: true       // Enable exponential backoff
-};
-```
+// Example request
+const response = await fetch('https://your-project.supabase.co/functions/v1/transcribe-audio', {
+  method: 'POST',
+  headers: {
+    'Authorization': 'Bearer your-supabase-auth-token',
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify({
+    audioData: 'base64_encoded_audio_data',
+    meetingId: 'meeting-uuid',
+    languageCode: 'en_us',
+    features: ['sentiment_analysis', 'entity_detection']
+  })
+});
 
-Error Handling:
-```typescript
-subscribeToTranscriptionStatus(callback: (status: string) => void) {
-  if (!this.currentMeetingId) {
-    throw new Error('No active meeting to subscribe to.');
-  }
-
-  let retryCount = 0;
-  
-  const channel = this.supabase
-    .channel(`meeting-${this.currentMeetingId}`)
-    .on(
-      'postgres_changes',
-      {
-        event: 'UPDATE',
-        schema: 'public',
-        table: 'meetings',
-        filter: `id=eq.${this.currentMeetingId}`
-      },
-      (payload) => callback(payload.new.transcription_status)
-    )
-    .on('error', (error) => {
-      console.error('Subscription error:', error);
-      if (retryCount < REALTIME_CONFIG.maxRetries) {
-        retryCount++;
-        setTimeout(() => {
-          channel.subscribe();
-        }, REALTIME_CONFIG.retryInterval * retryCount);
-      }
-    })
-    .subscribe();
-
-  return channel;
-}
+const result = await response.json();
 ```
 
 ## Support

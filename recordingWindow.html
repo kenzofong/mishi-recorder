@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Mishi Recorder</title>
+    <style>
+        :root {
+            --bg-color: rgba(255, 255, 255, 0.95);
+            --text-color: #000;
+            --waveform-bg: rgba(245, 245, 245, 0.8);
+            --waveform-stroke: #2196F3;
+            --button-hover: rgba(0, 0, 0, 0.05);
+            --record-button-bg: #FF4B4B;
+            --stop-button-bg: #4CAF50;
+            --clipping-color: #FF4B4B;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg-color: rgba(32, 32, 32, 0.95);
+                --text-color: #fff;
+                --waveform-bg: rgba(44, 44, 44, 0.8);
+                --waveform-stroke: #64B5F6;
+                --button-hover: rgba(255, 255, 255, 0.1);
+                --record-button-bg: #FF5252;
+                --stop-button-bg: #66BB6A;
+                --clipping-color: #FF5252;
+            }
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+            background: var(--bg-color);
+            color: var(--text-color);
+            border-radius: 12px;
+            overflow: hidden;
+            user-select: none;
+            transition: background-color 0.3s ease;
+        }
+
+        .container {
+            display: flex;
+            align-items: center;
+            padding: 12px;
+            gap: 12px;
+            height: 48px;
+            backdrop-filter: blur(10px);
+            animation: slideIn 0.2s ease-out;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        #waveform {
+            flex-grow: 1;
+            height: 32px;
+            background: var(--waveform-bg);
+            border-radius: 6px;
+            position: relative;
+            transition: background-color 0.3s ease;
+            overflow: hidden;
+            backdrop-filter: blur(5px);
+            box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.1);
+        }
+
+        #waveform canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+
+        .button {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            border: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: transparent;
+            transition: all 0.2s ease;
+            color: var(--text-color);
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+        }
+
+        .button:hover {
+            background: var(--button-hover);
+            transform: scale(1.05);
+        }
+
+        .button:active {
+            transform: scale(0.95);
+        }
+
+        .button svg {
+            width: 16px;
+            height: 16px;
+            transition: transform 0.2s ease;
+        }
+
+        #caretButton svg {
+            transition: transform 0.3s ease;
+        }
+
+        #caretButton.active svg {
+            transform: rotate(180deg);
+        }
+
+        #recordButton {
+            background: var(--record-button-bg);
+            transition: background-color 0.3s ease, transform 0.2s ease;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+        }
+
+        #recordButton.recording {
+            background: var(--stop-button-bg);
+        }
+
+        #recordButton.recording svg {
+            transform: scale(0.8);
+        }
+
+        #recordButton svg {
+            fill: white;
+        }
+
+        .draggable {
+            -webkit-app-region: drag;
+        }
+
+        .non-draggable {
+            -webkit-app-region: no-drag;
+        }
+
+        /* Recording duration display */
+        #duration {
+            position: absolute;
+            right: 8px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 12px;
+            opacity: 0.7;
+            font-variant-numeric: tabular-nums;
+            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+            z-index: 1;
+        }
+
+        /* Audio level indicator */
+        #levelIndicator {
+            position: absolute;
+            left: 8px;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--waveform-stroke);
+            opacity: 0;
+            transition: all 0.2s ease;
+            box-shadow: 0 0 4px var(--waveform-stroke);
+            z-index: 1;
+        }
+
+        #levelIndicator.active {
+            opacity: 1;
+            transform: translateY(-50%) scale(1.2);
+        }
+
+        #levelIndicator.clipping {
+            background: var(--clipping-color);
+            box-shadow: 0 0 8px var(--clipping-color);
+            animation: pulse 0.5s ease-in-out infinite alternate;
+        }
+
+        @keyframes pulse {
+            from {
+                transform: translateY(-50%) scale(1.2);
+            }
+            to {
+                transform: translateY(-50%) scale(1.5);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container draggable">
+        <div id="waveform" class="non-draggable">
+            <div id="levelIndicator"></div>
+            <div id="duration"></div>
+        </div>
+        <button id="caretButton" class="button non-draggable" title="Settings">
+            <svg viewBox="0 0 24 24">
+                <path d="M7 10l5 5 5-5H7z" fill="currentColor"/>
+            </svg>
+        </button>
+        <button id="recordButton" class="button non-draggable" title="Start Recording">
+            <svg viewBox="0 0 24 24" id="recordIcon">
+                <circle cx="12" cy="12" r="6"/>
+            </svg>
+        </button>
+    </div>
+    <script src="recordingWindow.js"></script>
+</body>
+</html> 

@@ -6,19 +6,32 @@ const { v4: uuidv4 } = require('uuid');
 class MishiIntegration {
     constructor(config) {
         // Create a client with the service role key for direct database access
-        this.supabase = createClient(config.supabaseUrl, config.supabaseKey, {
+        this.supabaseAdmin = createClient(config.supabaseUrl, config.supabaseKey, {
             auth: {
                 autoRefreshToken: false,
                 persistSession: false
             }
         });
+
+        // Create a client with anon key for user-context operations
+        this.supabaseUser = createClient(config.supabaseUrl, config.anonKey, {
+            auth: {
+                autoRefreshToken: true,
+                persistSession: true,
+                detectSessionInUrl: false
+            }
+        });
+
         this.webAppUrl = config.webAppUrl;
         this.currentMeetingId = null;
         this.workspaceId = null;
         this.userAccessToken = null;
+
+        // Add channels map to track active subscriptions
+        this.channels = new Map();
     }
 
-    async initialize(userId, accessToken) {
+    async initialize(userId, accessToken, refreshToken) {
         if (!userId) {
             throw new Error('User ID is required to initialize Mishi integration');
         }
@@ -27,12 +40,18 @@ class MishiIntegration {
             throw new Error('Access token is required to initialize Mishi integration');
         }
 
+        // Set the session for the user client with refresh token if available
+        await this.supabaseUser.auth.setSession({
+            access_token: accessToken,
+            refresh_token: refreshToken || '' // Use provided refresh token or empty string
+        });
+
         this.userAccessToken = accessToken;
         console.log('Initializing workspace for user:', userId);
 
         try {
-            // Direct query to get workspace membership
-            const { data: workspaceMember, error: memberError } = await this.supabase
+            // Direct query to get workspace membership using admin client
+            const { data: workspaceMember, error: memberError } = await this.supabaseAdmin
                 .from('workspace_members')
                 .select(`
                     id,
@@ -68,8 +87,8 @@ class MishiIntegration {
 
     async createDefaultWorkspace(userId) {
         try {
-            // Create a new workspace
-            const { data: workspace, error: workspaceError } = await this.supabase
+            // Create a new workspace using admin client
+            const { data: workspace, error: workspaceError } = await this.supabaseAdmin
                 .from('workspaces')
                 .insert({
                     name: 'My Workspace',
@@ -80,8 +99,8 @@ class MishiIntegration {
 
             if (workspaceError) throw workspaceError;
 
-            // Add user as workspace owner
-            const { error: memberError } = await this.supabase
+            // Add user as workspace owner using admin client
+            const { error: memberError } = await this.supabaseAdmin
                 .from('workspace_members')
                 .insert({
                     workspace_id: workspace.id,
@@ -110,8 +129,8 @@ class MishiIntegration {
             throw new Error('User ID is required to create a meeting.');
         }
 
-        // Create meeting first
-        const { data: meeting, error } = await this.supabase
+        // Create meeting using admin client
+        const { data: meeting, error } = await this.supabaseAdmin
             .from('meetings')
             .insert({
                 title,
@@ -128,18 +147,43 @@ class MishiIntegration {
         return meeting;
     }
 
-    async transcribeAudio(audioBlob) {
-        if (!this.currentMeetingId) {
-            throw new Error('No active meeting. Call startRecordingSession first.');
+    async transcribeAudio(audioBlob, meetingId, additionalFeatures = []) {
+        if (!meetingId) {
+            throw new Error('Meeting ID is required for transcription.');
         }
 
-        if (!this.userAccessToken) {
-            throw new Error('User access token not set. Call initialize() first.');
-        }
-
-        console.log('Starting audio transcription for meeting:', this.currentMeetingId);
+        console.log('[transcribeAudio] Starting audio transcription for meeting:', meetingId);
 
         try {
+            // Set up subscription BEFORE invoking Edge Function
+            console.log('[transcribeAudio] Setting up subscription before invoking Edge Function');
+            const channelId = `meeting-${meetingId}`;
+            
+            // Set up status subscription
+            const cleanup = this.subscribeToTranscriptionStatus(meetingId, (status, meeting) => {
+                console.log('[transcribeAudio] Status update:', {
+                    status,
+                    hasMeeting: !!meeting,
+                    timestamp: new Date().toISOString()
+                });
+            });
+
+            console.log('[transcribeAudio] Proceeding with Edge Function invocation');
+
+            // Try to refresh the session first
+            const { data: refreshData, error: refreshError } = await this.supabaseUser.auth.refreshSession();
+            if (refreshError) {
+                console.error('[transcribeAudio] Session refresh error:', refreshError);
+            } else if (refreshData?.session) {
+                console.log('[transcribeAudio] Session refreshed successfully');
+            }
+
+            // Now check if we have a valid session
+            const { data: { session }, error: sessionError } = await this.supabaseUser.auth.getSession();
+            if (sessionError || !session) {
+                throw new Error('No valid authentication session');
+            }
+
             // For Node.js Buffer input
             const audioBuffer = Buffer.isBuffer(audioBlob) ? audioBlob : Buffer.from(audioBlob);
             
@@ -148,118 +192,100 @@ class MishiIntegration {
                 throw new Error('Audio data is empty');
             }
 
-            console.log('Audio buffer size:', audioBuffer.length);
-
-            // Update meeting status
-            await this.supabase
-                .from('meetings')
-                .update({ transcription_status: 'processing' })
-                .eq('id', this.currentMeetingId);
+            console.log('[transcribeAudio] Audio buffer size:', audioBuffer.length);
 
             // Convert audio buffer to base64
             const audioData = audioBuffer.toString('base64');
 
-            // Prepare the request payload
+            // Always include sentiment_analysis and entity_detection, then add any additional features
+            const features = ['sentiment_analysis', 'entity_detection', ...additionalFeatures];
+
+            // Prepare the request payload according to spec
             const payload = {
-                meetingId: this.currentMeetingId,
                 audioData,
-                audioFormat: {
-                    codec: 'pcm_s16le',
-                    sampleRate: 16000,
-                    channels: 1,
-                    container: 'wav',
-                    mimeType: 'audio/wav'
-                },
+                meetingId,
                 languageCode: 'en_us',
-                features: ['sentiment_analysis', 'auto_highlights', 'iab_categories']
+                features: [...new Set(features)] // Remove any duplicates
             };
 
-            // Get the Edge Function URL from the Supabase client
-            const edgeFunctionUrl = `${this.supabase.functions.url}/transcribe-audio`;
+            console.log('[transcribeAudio] Invoking Edge Function with features:', payload.features);
             
-            console.log('Sending request to Edge Function...');
-            
-            // Make the request with JSON payload
-            const response = await fetch(edgeFunctionUrl, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${this.userAccessToken}`,
-                    'apikey': this.supabase.supabaseKey
-                },
-                body: JSON.stringify(payload)
-            });
+            // Update meeting status to processing before invoking Edge Function
+            let updateAttempts = 0;
+            const maxAttempts = 3;
+            let updateSuccess = false;
 
-            // Get the response text first
-            const responseText = await response.text();
-            console.log('Edge Function raw response:', responseText);
+            while (updateAttempts < maxAttempts && !updateSuccess) {
+                try {
+                    const { error: updateError } = await this.supabaseAdmin
+                        .from('meetings')
+                        .update({ 
+                            transcription_status: 'processing',
+                            updated_at: new Date().toISOString()
+                        })
+                        .eq('id', meetingId);
 
-            // Try to parse the response as JSON
-            let responseData;
-            try {
-                responseData = JSON.parse(responseText);
-            } catch (e) {
-                console.error('Failed to parse response as JSON:', e);
-                responseData = { error: responseText };
+                    if (updateError) {
+                        console.error(`[transcribeAudio] Error updating meeting status (attempt ${updateAttempts + 1}):`, updateError);
+                        updateAttempts++;
+                        if (updateAttempts < maxAttempts) {
+                            await new Promise(resolve => setTimeout(resolve, 1000 * updateAttempts));
+                        }
+                    } else {
+                        updateSuccess = true;
+                        console.log('[transcribeAudio] Successfully updated meeting status to processing');
+                    }
+                } catch (error) {
+                    console.error(`[transcribeAudio] Error updating meeting status (attempt ${updateAttempts + 1}):`, error);
+                    updateAttempts++;
+                    if (updateAttempts < maxAttempts) {
+                        await new Promise(resolve => setTimeout(resolve, 1000 * updateAttempts));
+                    }
+                }
             }
 
-            if (!response.ok) {
-                const errorDetails = responseData.error || responseData.message || responseText;
-                console.error('Edge Function error:', {
-                    status: response.status,
-                    statusText: response.statusText,
-                    details: errorDetails,
-                    headers: Object.fromEntries(response.headers)
+            if (!updateSuccess) {
+                throw new Error('Failed to update meeting status after multiple attempts');
+            }
+            
+            // Invoke the Edge Function using user client for proper auth
+            const { data: responseData, error: functionError } = await this.supabaseUser
+                .functions.invoke('transcribe-audio', {
+                    body: payload
                 });
 
-                // Update meeting status to error with details
-                await this.supabase
-                    .from('meetings')
-                    .update({ 
-                        transcription_status: 'error',
-                        notes: `Transcription failed: ${errorDetails}`
-                    })
-                    .eq('id', this.currentMeetingId);
-
-                throw new Error(`Edge Function error (${response.status}): ${errorDetails}`);
+            if (functionError) {
+                console.error('[transcribeAudio] Edge Function error:', functionError);
+                throw new Error(`Edge Function error: ${functionError.message}`);
             }
 
-            console.log('Transcription completed successfully:', responseData);
-            
-            // Update meeting with transcription results
-            const { error: updateError } = await this.supabase
-                .from('meetings')
-                .update({
-                    transcription: JSON.stringify({
-                        text: responseData.text,
-                        utterances: responseData.utterances
-                    }),
-                    sentiment_analysis: JSON.stringify(responseData.sentimentAnalysis),
-                    topics: JSON.stringify(responseData.topics),
-                    key_phrases: JSON.stringify(responseData.keyPhrases),
-                    transcription_status: 'completed',
-                    updated_at: new Date().toISOString()
-                })
-                .eq('id', this.currentMeetingId);
-
-            if (updateError) {
-                console.error('Failed to update meeting with transcription:', updateError);
-                throw updateError;
+            if (!responseData) {
+                console.error('[transcribeAudio] No response data from Edge Function');
+                throw new Error('No response data from Edge Function');
             }
+
+            // Log the complete response for debugging
+            console.log('[transcribeAudio] Complete Edge Function response:', JSON.stringify(responseData, null, 2));
 
             return responseData;
+
         } catch (error) {
-            console.error('Transcription error:', error);
+            console.error('[transcribeAudio] Error:', error);
             
-            // Update meeting status to error if not already done
-            await this.supabase
-                .from('meetings')
-                .update({ 
-                    transcription_status: 'error',
-                    notes: `Transcription failed: ${error.message}`
-                })
-                .eq('id', this.currentMeetingId);
-            
+            // Update meeting status to error
+            try {
+                const { error: updateError } = await this.supabaseAdmin
+                    .from('meetings')
+                    .update({ transcription_status: 'error' })
+                    .eq('id', meetingId);
+
+                if (updateError) {
+                    console.error('[transcribeAudio] Error updating error status:', updateError);
+                }
+            } catch (updateError) {
+                console.error('[transcribeAudio] Error updating error status:', updateError);
+            }
+
             throw error;
         }
     }
@@ -269,8 +295,8 @@ class MishiIntegration {
             throw new Error('No active meeting.');
         }
 
-        // Generate a one-time access token
-        const { data: token, error: tokenError } = await this.supabase
+        // Generate a one-time access token using admin client
+        const { data: token, error: tokenError } = await this.supabaseAdmin
             .rpc('generate_meeting_access_token', {
                 p_meeting_id: this.currentMeetingId,
                 p_user_id: userId
@@ -280,26 +306,6 @@ class MishiIntegration {
 
         // Construct URL with token
         return `${this.webAppUrl}/meeting/${this.currentMeetingId}?access_token=${token}`;
-    }
-
-    subscribeToTranscriptionStatus(callback) {
-        if (!this.currentMeetingId) {
-            throw new Error('No active meeting to subscribe to.');
-        }
-
-        return this.supabase
-            .channel(`meeting-${this.currentMeetingId}`)
-            .on(
-                'postgres_changes',
-                {
-                    event: 'UPDATE',
-                    schema: 'public',
-                    table: 'meetings',
-                    filter: `id=eq.${this.currentMeetingId}`
-                },
-                (payload) => callback(payload.new.transcription_status)
-            )
-            .subscribe();
     }
 
     async blobToBase64(buffer) {
@@ -316,6 +322,196 @@ class MishiIntegration {
             console.error('Error converting audio to base64:', error);
             throw new Error(`Failed to convert audio to base64: ${error.message}`);
         }
+    }
+
+    async fetchUpdatedMeeting(meetingId) {
+        console.log('[fetchUpdatedMeeting] Fetching meeting:', meetingId);
+        try {
+            // Use supabaseAdmin to ensure we can fetch all fields
+            const { data, error } = await this.supabaseAdmin
+                .from('meetings')
+                .select(`
+                    *,
+                    workspace:workspaces(id, name)
+                `)
+                .eq('id', meetingId)
+                .single();
+                
+            if (error) {
+                console.error('[fetchUpdatedMeeting] Database error:', error);
+                throw error;
+            }
+            
+            if (!data) {
+                console.error('[fetchUpdatedMeeting] No data returned for meeting:', meetingId);
+                throw new Error('Meeting not found');
+            }
+
+            console.log('[fetchUpdatedMeeting] Successfully fetched meeting:', {
+                id: data.id,
+                hasTranscription: !!data.transcription,
+                transcriptionLength: data.transcription?.length || 0,
+                status: data.transcription_status
+            });
+
+            return data;
+        } catch (error) {
+            console.error('[fetchUpdatedMeeting] Error:', error);
+            throw error;
+        }
+    }
+
+    async cleanup(channelId = null) {
+        console.log('[Cleanup] Starting cleanup', {
+            specificChannel: !!channelId,
+            totalChannels: this.channels.size,
+            timestamp: new Date().toISOString()
+        });
+
+        try {
+            if (channelId) {
+                // Clean up specific channel
+                const channel = this.channels.get(channelId);
+                if (channel) {
+                    console.log('[Cleanup] Removing specific subscription:', channelId);
+                    await channel.unsubscribe();
+                    this.channels.delete(channelId);
+                    console.log('[Cleanup] Successfully removed subscription:', channelId);
+                }
+            } else {
+                // Clean up all channels
+                for (const [id, channel] of this.channels.entries()) {
+                    console.log('[Cleanup] Removing subscription:', id);
+                    try {
+                        await channel.unsubscribe();
+                        console.log('[Cleanup] Successfully unsubscribed channel:', id);
+                    } catch (error) {
+                        console.error('[Cleanup] Error unsubscribing channel:', {
+                            channelId: id,
+                            error,
+                            timestamp: new Date().toISOString()
+                        });
+                    } finally {
+                        this.channels.delete(id);
+                    }
+                }
+            }
+            
+            console.log('[Cleanup] Cleanup completed', {
+                remainingChannels: this.channels.size,
+                timestamp: new Date().toISOString()
+            });
+        } catch (error) {
+            console.error('[Cleanup] Error during cleanup:', {
+                error,
+                timestamp: new Date().toISOString()
+            });
+            throw error;
+        }
+    }
+
+    subscribeToTranscriptionStatus(meetingId, callback) {
+        console.log('[subscribeToTranscriptionStatus] Setting up status subscription:', {
+            meetingId,
+            timestamp: new Date().toISOString()
+        });
+
+        if (!meetingId) {
+            throw new Error('Meeting ID is required for status subscription');
+        }
+
+        const channelId = `meeting-${meetingId}`;
+        
+        // Return existing channel if we already have one
+        if (this.channels.has(channelId)) {
+            console.log('[subscribeToTranscriptionStatus] Using existing channel subscription');
+            return () => this.cleanup(channelId);
+        }
+
+        const channel = this.supabaseUser
+            .channel(channelId, {
+                config: {
+                    broadcast: { self: true },
+                    presence: { key: '' }
+                }
+            })
+            .on(
+                'postgres_changes',
+                {
+                    event: '*',
+                    schema: 'public',
+                    table: 'meetings',
+                    filter: `id=eq.${meetingId}`
+                },
+                async (payload) => {
+                    console.log('[Status Subscription] Received update:', {
+                        eventType: payload.eventType,
+                        meetingId: payload.new?.id,
+                        oldStatus: payload.old?.transcription_status,
+                        newStatus: payload.new?.transcription_status,
+                        hasTranscription: !!payload.new?.transcription,
+                        timestamp: new Date().toISOString()
+                    });
+
+                    if (payload.eventType === 'UPDATE' && payload.new) {
+                        // Use the payload data directly instead of fetching
+                        callback(payload.new.transcription_status, payload.new);
+                    }
+                }
+            )
+            .on('state_change', ({ from, to }) => {
+                console.log('[Status Subscription] Channel state changed:', {
+                    from,
+                    to,
+                    channelId,
+                    timestamp: new Date().toISOString()
+                });
+            })
+            .on('error', (error) => {
+                console.error('[Status Subscription] Channel error:', {
+                    error,
+                    channelId,
+                    timestamp: new Date().toISOString()
+                });
+                callback('error', null);
+            });
+
+        // Store the channel for cleanup
+        this.channels.set(channelId, channel);
+
+        // Subscribe to the channel and wait for it to be ready
+        channel.subscribe(async (status) => {
+            console.log('[Status Subscription] Subscribe callback:', {
+                status,
+                channelId,
+                timestamp: new Date().toISOString()
+            });
+
+            // Get initial state from the payload when subscription is ready
+            if (status === 'SUBSCRIBED') {
+                try {
+                    // Get current state directly from the database once
+                    const { data: meeting, error } = await this.supabaseAdmin
+                        .from('meetings')
+                        .select('*')
+                        .eq('id', meetingId)
+                        .single();
+
+                    if (error) throw error;
+                    if (meeting) {
+                        callback(meeting.transcription_status, meeting);
+                    }
+                } catch (error) {
+                    console.error('[Status Subscription] Error fetching initial state:', error);
+                }
+            }
+        });
+
+        return () => {
+            // Return cleanup function
+            console.log('[Status Subscription] Cleaning up subscription:', channelId);
+            this.cleanup(channelId);
+        };
     }
 }
 

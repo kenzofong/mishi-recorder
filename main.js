@@ -1,4 +1,4 @@
-const { app, Tray, Menu, nativeImage, ipcMain, BrowserWindow, shell, dialog } = require('electron');
+const { app, Tray, Menu, nativeImage, ipcMain, BrowserWindow, shell, dialog, systemPreferences, screen } = require('electron');
 const path = require('path');
 require('dotenv').config(); // Load .env file variables into process.env
 const Store = require('electron-store');
@@ -29,12 +29,23 @@ const OAUTH_CALLBACK_WINDOW_OPTIONS = {
 
 // --- Globals ---
 let tray = null;
-let audioRecorder = new AudioRecorder();
+let audioRecorder = null; // Initialize later with settings
 let mishiIntegration = null;
 let tempRecordingPath = path.join(app.getPath('userData'), TEMP_RECORDING_FILENAME);
-const store = new Store(); // Used for storing user session/token
+const store = new Store({
+    schema: {
+        inputDevice: {
+            type: 'object',
+            properties: {
+                type: { type: 'string', enum: ['system', 'mic'], default: 'system' },
+                index: { type: 'number', default: 0 }
+            },
+            default: { type: 'system', index: 0 }
+        }
+    }
+});
 
-// Add Electron Store adapter for Supabase
+// Create Supabase storage adapter using electron-store
 const electronStoreAdapter = {
     getItem: (key) => {
         return store.get(key);
@@ -44,45 +55,8 @@ const electronStoreAdapter = {
     },
     removeItem: (key) => {
         store.delete(key);
-    },
-};
-
-// Add audio settings to electron-store
-store.set('audioSettings', store.get('audioSettings', {
-    inputDevice: {
-        type: 'microphone',  // 'microphone' or 'system'
-        index: 0            // Default device index
-    },
-    processing: {
-        noiseReduction: {
-            enabled: true,
-            nr: 10,
-            nf: -25,
-            nt: 'w'
-        },
-        loudnessNorm: {
-            enabled: true,
-            targetLevel: -16,
-            truePeak: -1.5
-        },
-        compression: {
-            enabled: false,
-            threshold: -20,
-            ratio: 3,
-            attack: 0.1,
-            release: 0.2
-        },
-        vad: {
-            enabled: false,
-            threshold: -30,
-            duration: 0.5
-        }
-    },
-    recording: {
-        sampleRate: 16000,  // 16kHz as recommended
-        format: 'wav'       // WAV format for transcription
     }
-}));
+};
 
 let supabase = null;
 
@@ -98,11 +72,17 @@ const oauth2Client = new OAuth2Client({
 let state = {
     isLoggedIn: false,
     isRecording: false,
-    statusMessage: 'Idle', // Idle, Recording, Uploading, Error: <msg>
+    statusMessage: 'Initializing...', // Changed initial status
     user: null,
     currentMeeting: null,
     transcriptionStatus: null
 };
+
+// Add recordingWindow to globals
+let recordingWindow = null;
+
+// Add settingsWindow to globals
+let settingsWindow = null;
 
 // --- Initialization ---
 
@@ -110,10 +90,7 @@ let state = {
 if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
     console.error("FATAL ERROR: Supabase URL or Anon Key not found in environment variables.");
     console.error("Please ensure you have a .env file with SUPABASE_URL and SUPABASE_ANON_KEY defined.");
-    // Optionally: Show a dialog to the user
-    // dialog.showErrorBox('Configuration Error', 'Supabase URL or Key missing. Check .env file.');
-    app.quit(); // Exit if configuration is missing
-    // Throwing error might be better in some cases, but quit is direct here.
+    app.quit();
 }
 
 // Initialize Supabase Client
@@ -144,24 +121,68 @@ try {
     
     // Listen for auth state changes
     supabase.auth.onAuthStateChange(async (event, session) => {
-        console.log('Auth state changed:', event, session?.user?.id);
-        if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') {
+        console.log('Auth state changed:', {
+            event,
+            userId: session?.user?.id,
+            hasAccessToken: !!session?.access_token,
+            timestamp: new Date().toISOString()
+        });
+
+        if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'INITIAL_SESSION') {
             try {
-                await mishiIntegration.initialize(session.user.id, session.access_token);
-                setState({ isLoggedIn: true, user: session.user, statusMessage: 'Idle' });
+                // Get the latest session to ensure we have fresh tokens
+                const { data: { session: currentSession }, error: sessionError } = await supabase.auth.getSession();
+                if (sessionError) throw sessionError;
+                if (!currentSession) throw new Error('No session available after sign in');
+
+                console.log('Initializing with fresh session:', {
+                    userId: currentSession.user.id,
+                    hasAccessToken: !!currentSession.access_token,
+                    hasRefreshToken: !!currentSession.refresh_token,
+                    event
+                });
+
+                await mishiIntegration.initialize(
+                    currentSession.user.id, 
+                    currentSession.access_token,
+                    currentSession.refresh_token
+                );
+                console.log('Mishi integration initialized successfully');
+                
+                setState({ 
+                    isLoggedIn: true, 
+                    user: currentSession.user, 
+                    statusMessage: 'Idle',
+                    transcriptionStatus: null,
+                    currentMeeting: null
+                });
             } catch (error) {
                 console.error('Failed to initialize workspace on auth change:', error);
                 // Don't set isLoggedIn to true if workspace initialization fails
                 setState({ 
                     isLoggedIn: false, 
                     user: null,
-                    statusMessage: `Error: ${error.message}` 
+                    statusMessage: `Error: ${error.message}`,
+                    transcriptionStatus: null,
+                    currentMeeting: null
                 });
                 // Force logout on workspace initialization failure
-                await supabase.auth.signOut();
+                try {
+                    await supabase.auth.signOut();
+                    console.log('Forced sign out after initialization failure');
+                } catch (signOutError) {
+                    console.error('Error during forced sign out:', signOutError);
+                }
             }
         } else if (event === 'SIGNED_OUT') {
-            setState({ isLoggedIn: false, user: null, statusMessage: 'Idle' });
+            console.log('User signed out, resetting state');
+            setState({ 
+                isLoggedIn: false, 
+                user: null, 
+                statusMessage: 'Idle',
+                transcriptionStatus: null,
+                currentMeeting: null
+            });
         }
     });
     
@@ -179,10 +200,14 @@ try {
     if (!SUPABASE_SERVICE_ROLE_KEY) {
         throw new Error("Supabase service role key not found in environment variables");
     }
+    if (!SUPABASE_ANON_KEY) {
+        throw new Error("Supabase anon key not found in environment variables");
+    }
     
     mishiIntegration = new MishiIntegration({
         supabaseUrl: SUPABASE_URL,
-        supabaseKey: SUPABASE_SERVICE_ROLE_KEY,  // Use service role key for direct DB access
+        supabaseKey: SUPABASE_SERVICE_ROLE_KEY,  // Service role key for admin operations
+        anonKey: SUPABASE_ANON_KEY,             // Anon key for user operations
         webAppUrl: MISHI_WEB_APP_URL
     });
     
@@ -195,41 +220,140 @@ try {
 // --- Tray Setup ---
 
 function createTray() {
-    console.log("Attempting to create tray...");
-    // IMPORTANT: Create an 'assets' directory in your project root
-    // and place a suitable icon there. Template images are recommended for macOS.
-    // Example: assets/iconTemplate.png (black/white image)
-    const iconPath = path.join(__dirname, 'assets', 'iconTemplate.png');
-    console.log(`Icon path: ${iconPath}`);
-    let icon;
-    try {
-        icon = nativeImage.createFromPath(iconPath);
-        console.log(`Icon loaded successfully? ${!icon.isEmpty()}`);
-        icon.setTemplateImage(true); // Crucial for macOS dark/light mode compatibility
-    } catch (err) {
-        console.error("Error loading tray icon:", err);
-        // Use a default Electron icon or handle the error
-        icon = nativeImage.createEmpty(); // Placeholder
-        console.log("Using empty placeholder icon due to error.");
+    if (tray !== null) {
+        console.log("Tray already exists, skipping creation");
+        return;
     }
 
+    console.log("Creating tray icon...");
+    
+    // Get the absolute path to the icon
+    const iconPath = path.join(__dirname, 'assets', 'iconTemplate.png');
+    console.log(`Looking for icon at: ${iconPath}`);
+    
+    // Verify the icon file exists
+    if (!fs.existsSync(iconPath)) {
+        console.error(`Icon file not found at ${iconPath}`);
+        throw new Error('Tray icon file not found');
+    }
 
-    tray = new Tray(icon);
-    console.log(`Tray object created? ${tray ? 'Yes' : 'No'}`);
-    tray.setToolTip('Mishi Recorder');
-    console.log("Tooltip set.");
-    updateTrayMenu(); // Build initial menu
-    console.log("Initial tray menu updated.");
+    try {
+        // Create the icon
+        const icon = nativeImage.createFromPath(iconPath);
+        
+        // Verify the icon was loaded successfully
+        if (icon.isEmpty()) {
+            console.error("Failed to load icon - nativeImage is empty");
+            throw new Error('Failed to load tray icon');
+        }
+
+        // Set template image for proper dark/light mode handling on macOS
+        if (process.platform === 'darwin') {
+            icon.setTemplateImage(true);
+        }
+
+        // Create the tray
+        tray = new Tray(icon);
+        
+        // Verify tray was created
+        if (!tray) {
+            throw new Error('Failed to create tray');
+        }
+
+        // Configure tray
+        tray.setToolTip('Mishi Recorder');
+        
+        // Set up initial menu
+        updateTrayMenu();
+        
+        // Add click handler
+        tray.on('click', () => {
+            if (recordingWindow && recordingWindow.isVisible()) {
+                recordingWindow.hide();
+            } else {
+                createRecordingWindow();
+            }
+        });
+
+        console.log("Tray created successfully");
+    } catch (error) {
+        console.error("Error creating tray:", error);
+        
+        // If tray creation failed, try to create a basic tray with a fallback icon
+        try {
+            console.log("Attempting to create tray with fallback icon...");
+            const fallbackIcon = nativeImage.createEmpty();
+            tray = new Tray(fallbackIcon);
+            tray.setToolTip('Mishi Recorder (Fallback Mode)');
+            updateTrayMenu();
+            console.log("Created tray with fallback icon");
+        } catch (fallbackError) {
+            console.error("Critical: Failed to create tray even with fallback:", fallbackError);
+            dialog.showErrorBox(
+                'Tray Creation Failed',
+                'Failed to create application tray icon. The application may not function correctly.'
+            );
+        }
+    }
+}
+
+// Add a function to destroy and recreate tray (can be useful for debugging)
+function recreateTray() {
+    if (tray) {
+        console.log("Destroying existing tray...");
+        tray.destroy();
+        tray = null;
+    }
+    createTray();
+}
+
+// Add tray recreation attempt on certain events
+app.on('ready', () => {
+    // Existing ready handler code...
+    
+    // Add a delayed tray creation as fallback
+    setTimeout(() => {
+        if (!tray) {
+            console.log("No tray detected after startup, attempting recreation...");
+            createTray();
+        }
+    }, 1000);
+});
+
+if (process.platform === 'darwin') {
+    // On macOS, recreate tray when activating the app
+    app.on('activate', () => {
+        if (!tray) {
+            console.log("No tray detected on activate, recreating...");
+            createTray();
+        }
+    });
 }
 
 function updateTrayMenu() {
-    if (!tray) return;
+    if (!tray) {
+        console.log("Cannot update tray menu - tray not initialized");
+        return;
+    }
+
+    console.log("Updating tray menu with state:", {
+        isLoggedIn: state.isLoggedIn,
+        statusMessage: state.statusMessage,
+        isRecording: state.isRecording,
+        hasCurrentMeeting: !!state.currentMeeting
+    });
+
     const contextMenu = Menu.buildFromTemplate(buildContextMenuTemplate());
     tray.setContextMenu(contextMenu);
 }
 
 function buildContextMenuTemplate() {
-    const settings = store.get('audioSettings');
+    console.log("Building menu template with state:", {
+        isLoggedIn: state.isLoggedIn,
+        statusMessage: state.statusMessage
+    });
+
+    const inputDevice = store.get('inputDevice');
     const menuTemplate = [
         { label: `Status: ${state.statusMessage}`, enabled: false },
     ];
@@ -254,26 +378,11 @@ function buildContextMenuTemplate() {
                     label: 'Audio Input',
                     submenu: [
                         { 
-                            label: `Current: ${settings.inputDevice.type === 'microphone' ? 'Microphone' : 'System Audio'}`,
+                            label: `Current: ${inputDevice.type === 'mic' ? 'Microphone' : 'System Audio'}`,
                             enabled: false 
                         },
                         { type: 'separator' },
                         { label: 'Select Input...', click: selectAudioInput }
-                    ]
-                },
-                { 
-                    label: 'Audio Processing',
-                    submenu: [
-                        { 
-                            label: `Noise Reduction: ${settings.processing.noiseReduction.enabled ? 'On' : 'Off'}`,
-                            enabled: false 
-                        },
-                        { 
-                            label: `Normalization: ${settings.processing.loudnessNorm.enabled ? 'On' : 'Off'}`,
-                            enabled: false 
-                        },
-                        { type: 'separator' },
-                        { label: 'Configure...', click: configureAudioProcessing }
                     ]
                 },
                 { type: 'separator' }
@@ -281,7 +390,7 @@ function buildContextMenuTemplate() {
         }
         menuTemplate.push({ label: 'Logout', click: logout });
     } else {
-        menuTemplate.push({ label: 'Login', click: openLoginWindow }); // Or trigger other auth flow
+        menuTemplate.push({ label: 'Login', click: openLoginWindow });
     }
 
     menuTemplate.push({ type: 'separator' });
@@ -300,9 +409,34 @@ function buildContextMenuTemplate() {
 // --- State Management ---
 
 function setState(newState) {
+    const oldState = { ...state };
     state = { ...state, ...newState };
-    console.log("State updated:", state); // For debugging
-    updateTrayMenu(); // Update the menu whenever state changes
+    console.log("State changed:", {
+        from: {
+            isLoggedIn: oldState.isLoggedIn,
+            statusMessage: oldState.statusMessage,
+            userId: oldState.user?.id
+        },
+        to: {
+            isLoggedIn: state.isLoggedIn,
+            statusMessage: state.statusMessage,
+            userId: state.user?.id
+        }
+    });
+    
+    // Ensure tray exists before updating menu
+    if (!tray) {
+        console.log("Tray not available, creating it...");
+        createTray();
+    }
+    
+    updateTrayMenu();
+    
+    if (state.isRecording) {
+        startAudioVisualization();
+    } else {
+        stopAudioVisualization();
+    }
 }
 
 // --- Core Functionality (Placeholders) ---
@@ -347,11 +481,20 @@ async function login(email, password) {
             throw error;
         }
 
-        // Initialize Mishi integration with the user's workspace
+        // Get fresh session data immediately after login
+        const { data: { session: freshSession }, error: refreshError } = await supabase.auth.getSession();
+        if (refreshError) throw refreshError;
+        if (!freshSession) throw new Error('No session available after login');
+
+        // Initialize Mishi integration with fresh session
         try {
-            await mishiIntegration.initialize(data.user.id, data.session.access_token);
+            await mishiIntegration.initialize(
+                freshSession.user.id, 
+                freshSession.access_token,
+                freshSession.refresh_token
+            );
             console.log("Mishi integration initialized with workspace after login");
-            setState({ isLoggedIn: true, user: data.user, statusMessage: 'Idle' });
+            setState({ isLoggedIn: true, user: freshSession.user, statusMessage: 'Idle' });
             return { success: true };
         } catch (mishiError) {
             console.error("Failed to initialize workspace:", mishiError.message);
@@ -386,6 +529,21 @@ async function logout() {
     }
 }
 
+// Initialize AudioRecorder with settings from store
+function initializeAudioRecorder() {
+    const settings = {
+        inputDevice: store.get('inputDevice') || { type: 'system', index: 0 }
+    };
+
+    audioRecorder = new AudioRecorder(settings);
+
+    audioRecorder.on('audioData', (data) => {
+        if (recordingWindow && !recordingWindow.isDestroyed()) {
+            recordingWindow.webContents.send('audio-data', data);
+        }
+    });
+}
+
 async function startRecording() {
     try {
         if (!state.isLoggedIn) {
@@ -398,16 +556,27 @@ async function startRecording() {
             return;
         }
 
+        // Ensure temp recording path exists
+        if (!tempRecordingPath) {
+            tempRecordingPath = path.join(app.getPath('userData'), TEMP_RECORDING_FILENAME);
+        }
+
         // Start a new meeting with the user ID
         const meeting = await mishiIntegration.startRecordingSession(title, state.user.id);
+        if (!meeting) {
+            throw new Error('Failed to create meeting session');
+        }
+
+        // Start recording audio
+        await audioRecorder.startRecording(tempRecordingPath);
+        
+        // Only update state after both operations succeed
         setState({ 
             isRecording: true, 
             statusMessage: 'Recording...', 
             currentMeeting: meeting 
         });
-
-        // Start recording audio
-        await audioRecorder.startRecording(tempRecordingPath);
+        
         updateTrayMenu();
     } catch (error) {
         console.error('Failed to start recording:', error);
@@ -423,23 +592,141 @@ async function startRecording() {
 async function stopRecording() {
     try {
         setState({ statusMessage: 'Stopping recording...' });
-        const recordingPath = await audioRecorder.stopRecording();
+        
+        // Ensure we have an active meeting
+        if (!state.currentMeeting) {
+            throw new Error('No active meeting session');
+        }
+
+        // Stop the recording
+        await audioRecorder.stopRecording();
         setState({ isRecording: false });
 
+        // Ensure we have a valid recording path
+        if (!tempRecordingPath) {
+            throw new Error('Recording path not set');
+        }
+
+        // Wait for the file to be fully written
+        await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                reject(new Error('Timeout waiting for file to be written'));
+            }, 5000);
+
+            const checkFile = async () => {
+                try {
+                    const stats = await fs.promises.stat(tempRecordingPath);
+                    if (stats.size > 0) {
+                        // Wait an additional second to ensure FFmpeg has finished writing
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                        clearTimeout(timeout);
+                        resolve();
+                    } else {
+                        setTimeout(checkFile, 100);
+                    }
+                } catch (error) {
+                    if (error.code === 'ENOENT') {
+                        setTimeout(checkFile, 100);
+                    } else {
+                        clearTimeout(timeout);
+                        reject(error);
+                    }
+                }
+            };
+
+            checkFile();
+        });
+
         // Read the recording file
-        const audioBlob = await fs.promises.readFile(recordingPath);
+        const audioBlob = await fs.promises.readFile(tempRecordingPath);
+        console.log('Read audio file, size:', audioBlob.length);
         setState({ statusMessage: 'Transcribing...' });
 
-        // Send for transcription
-        await mishiIntegration.transcribeAudio(audioBlob);
-        setState({ statusMessage: 'Processing transcription' });
+        try {
+            // Set up subscription BEFORE sending audio
+            const subscription = mishiIntegration.subscribeToTranscriptionStatus(
+                state.currentMeeting.id,
+                async (status, updatedMeeting) => {
+                    console.log('[Main] Transcription status update:', {
+                        status,
+                        hasMeetingData: !!updatedMeeting,
+                        meetingId: updatedMeeting?.id
+                    });
+                    
+                    setState({
+                        transcriptionStatus: status,
+                        statusMessage: status === 'completed' 
+                            ? 'Transcription completed' 
+                            : status === 'error' 
+                            ? 'Transcription failed' 
+                            : `Processing transcription (${status})`
+                    });
 
-        // Cleanup temp file
-        cleanupTempFile(recordingPath, 'Recording sent for transcription');
+                    // If we have updated meeting data, update state and notify windows
+                    if (updatedMeeting) {
+                        console.log('[Main] Updating meeting data:', {
+                            id: updatedMeeting.id,
+                            hasTranscription: !!updatedMeeting.transcription,
+                            transcriptionLength: updatedMeeting.transcription?.length || 0
+                        });
+
+                        state.currentMeeting = updatedMeeting;
+                        
+                        // Get all windows that need to be notified
+                        const windows = BrowserWindow.getAllWindows();
+                        console.log('[Main] Broadcasting update to windows:', windows.length);
+                        
+                        // Emit meeting update event to all windows
+                        windows.forEach(window => {
+                            if (!window.isDestroyed()) {
+                                console.log('[Main] Sending update to window:', window.getTitle());
+                                window.webContents.send('meeting-updated', {
+                                    type: 'meeting-updated',
+                                    meeting: updatedMeeting
+                                });
+                            }
+                        });
+                        
+                        // Open the meeting in the web app
+                        try {
+                            console.log('[Main] Opening meeting in web app');
+                            const url = await mishiIntegration.openInWebApp(state.user.id);
+                            shell.openExternal(url);
+                        } catch (error) {
+                            console.error('[Main] Error opening meeting in web app:', error);
+                            dialog.showErrorBox('Error', 'Failed to open meeting in web app');
+                        }
+                    }
+
+                    // Unsubscribe after completion or error
+                    if (status === 'completed' || status === 'error') {
+                        console.log('[Main] Unsubscribing from updates');
+                        subscription();  // Call the cleanup function
+                    }
+                }
+            );
+
+            // Send for transcription with meeting ID
+            const response = await mishiIntegration.transcribeAudio(audioBlob, state.currentMeeting.id);
+
+        } catch (transcriptionError) {
+            console.error('Transcription error:', transcriptionError);
+            setState({ 
+                statusMessage: `Error: ${transcriptionError.message}`,
+                transcriptionStatus: 'error'
+            });
+            dialog.showErrorBox('Transcription Error', transcriptionError.message);
+        } finally {
+            // Cleanup temp file regardless of transcription success/failure
+            cleanupTempFile(tempRecordingPath, 'Recording sent for transcription');
+        }
 
     } catch (error) {
         console.error('Failed to stop recording:', error);
-        setState({ statusMessage: `Error: ${error.message}` });
+        setState({ 
+            statusMessage: `Error: ${error.message}`,
+            transcriptionStatus: 'error'
+        });
         dialog.showErrorBox('Recording Error', `Failed to stop recording: ${error.message}`);
     }
 }
@@ -465,8 +752,18 @@ function quitApp() {
         console.log("Attempting to stop recording process before quit...");
         audioRecorder.stopRecording()
             .catch(error => console.error("Error stopping recording during quit:", error))
-            .finally(() => app.quit());
+            .finally(() => {
+                if (mishiIntegration) {
+                    console.log("Cleaning up Mishi integration...");
+                    mishiIntegration.cleanup();
+                }
+                app.quit();
+            });
     } else {
+        if (mishiIntegration) {
+            console.log("Cleaning up Mishi integration...");
+            mishiIntegration.cleanup();
+        }
         app.quit();
     }
 }
@@ -481,47 +778,103 @@ app.on('ready', async () => {
 
     console.log("App Ready. Initializing...");
 
+    // Initialize AudioRecorder
+    initializeAudioRecorder();
+
     // Initialize IPC Listeners if a login window will be used
     setupIPCListeners();
+
+    // Create tray first to ensure it exists
+    createTray();
 
     // Attempt to retrieve the session from storage on startup
     if (supabase) {
         try {
             const { data: { session }, error } = await supabase.auth.getSession();
-            console.log("Retrieved session on startup:", session);
+            console.log("Retrieved session on startup:", {
+                hasSession: !!session,
+                hasAccessToken: session?.access_token,
+                hasRefreshToken: session?.refresh_token
+            });
+            
             if (error) {
                 console.error("Error retrieving session:", error.message);
                 setState({ statusMessage: 'Error: Session check failed' });
-            } else if (session) {
+                return;
+            }
+
+            if (session) {
                 console.log("User session found, setting state.");
-                // Initialize Mishi integration with the user's workspace
+                // Get fresh session data
+                const { data: { session: freshSession }, error: refreshError } = await supabase.auth.refreshSession();
+                if (refreshError) {
+                    console.error("Error refreshing session:", refreshError);
+                    setState({ statusMessage: 'Error: Session refresh failed' });
+                    return;
+                }
+                if (!freshSession) {
+                    console.log("No fresh session available after refresh.");
+                    setState({ isLoggedIn: false, user: null, statusMessage: 'Idle' });
+                    return;
+                }
+
+                // Initialize Mishi integration with fresh session
                 try {
-                    await mishiIntegration.initialize(session.user.id, session.access_token);
+                    await mishiIntegration.initialize(
+                        freshSession.user.id, 
+                        freshSession.access_token,
+                        freshSession.refresh_token
+                    );
                     console.log("Mishi integration initialized with workspace");
-                    setState({ isLoggedIn: true, user: session.user, statusMessage: 'Idle' });
-                } catch (mishiError) {
-                    console.error("Failed to initialize workspace:", mishiError);
-                    // Don't set isLoggedIn to false here - the user is still authenticated
                     setState({ 
                         isLoggedIn: true, 
-                        user: session.user,
-                        statusMessage: `Error: Workspace initialization failed - ${mishiError.message}` 
+                        user: freshSession.user, 
+                        statusMessage: 'Idle',
+                        transcriptionStatus: null,
+                        currentMeeting: null
+                    });
+                } catch (mishiError) {
+                    console.error("Failed to initialize workspace:", mishiError);
+                    setState({ 
+                        isLoggedIn: false,  // Changed to false since workspace init failed
+                        user: null,
+                        statusMessage: `Error: Workspace initialization failed - ${mishiError.message}`,
+                        transcriptionStatus: null,
+                        currentMeeting: null
                     });
                 }
             } else {
                 console.log("No active session found.");
-                setState({ isLoggedIn: false, user: null, statusMessage: 'Idle' });
+                setState({ 
+                    isLoggedIn: false, 
+                    user: null, 
+                    statusMessage: 'Idle',
+                    transcriptionStatus: null,
+                    currentMeeting: null
+                });
             }
         } catch(err) {
             console.error("Exception during session retrieval:", err);
-            setState({ statusMessage: 'Error: Session check failed' });
+            setState({ 
+                statusMessage: 'Error: Session check failed',
+                isLoggedIn: false,
+                user: null,
+                transcriptionStatus: null,
+                currentMeeting: null
+            });
         }
     } else {
         console.warn("Supabase client not available for session check.");
-        setState({ statusMessage: 'Error: Supabase connection issue' });
+        setState({ 
+            statusMessage: 'Error: Supabase connection issue',
+            isLoggedIn: false,
+            user: null,
+            transcriptionStatus: null,
+            currentMeeting: null
+        });
     }
 
-    createTray();
+    setupThemeChangeListener();
 });
 
 // Quit when all windows are closed (useful if you add BrowserWindows later)
@@ -565,7 +918,7 @@ function setupIPCListeners() {
 
             // Wait for workspace initialization
             try {
-                await mishiIntegration.initialize(data.user.id, data.session.access_token);
+                await mishiIntegration.initialize(data.user.id, data.session.access_token, data.session.refresh_token);
                 return { success: true };
             } catch (error) {
                 console.error('Workspace initialization error during login:', error);
@@ -774,12 +1127,10 @@ async function selectAudioInput() {
         const options = devices.map(device => ({
             label: device.name,
             click: () => {
-                const settings = store.get('audioSettings');
-                settings.inputDevice = {
-                    type: 'microphone',
+                store.set('inputDevice', {
+                    type: 'mic',
                     index: device.index
-                };
-                store.set('audioSettings', settings);
+                });
                 updateTrayMenu();
             }
         }));
@@ -789,12 +1140,10 @@ async function selectAudioInput() {
             options.unshift({
                 label: 'System Audio (requires BlackHole)',
                 click: () => {
-                    const settings = store.get('audioSettings');
-                    settings.inputDevice = {
+                    store.set('inputDevice', {
                         type: 'system',
-                        index: 0  // BlackHole index should be configured
-                    };
-                    store.set('audioSettings', settings);
+                        index: 0
+                    });
                     updateTrayMenu();
                 }
             });
@@ -805,42 +1154,6 @@ async function selectAudioInput() {
     } catch (error) {
         dialog.showErrorBox('Error', `Failed to list audio devices: ${error.message}`);
     }
-}
-
-async function configureAudioProcessing() {
-    const settings = store.get('audioSettings');
-    const template = [
-        {
-            label: 'Noise Reduction',
-            type: 'checkbox',
-            checked: settings.processing.noiseReduction.enabled,
-            click: (item) => {
-                settings.processing.noiseReduction.enabled = item.checked;
-                store.set('audioSettings', settings);
-            }
-        },
-        {
-            label: 'Loudness Normalization',
-            type: 'checkbox',
-            checked: settings.processing.loudnessNorm.enabled,
-            click: (item) => {
-                settings.processing.loudnessNorm.enabled = item.checked;
-                store.set('audioSettings', settings);
-            }
-        },
-        {
-            label: 'Voice Activity Detection',
-            type: 'checkbox',
-            checked: settings.processing.vad.enabled,
-            click: (item) => {
-                settings.processing.vad.enabled = item.checked;
-                store.set('audioSettings', settings);
-            }
-        }
-    ];
-
-    const processingMenu = Menu.buildFromTemplate(template);
-    processingMenu.popup();
 }
 
 // Add function to prompt for meeting title
@@ -878,4 +1191,317 @@ async function openMeetingInWebApp() {
         console.error('Failed to open meeting:', error);
         dialog.showErrorBox('Error', `Failed to open meeting: ${error.message}`);
     }
-} 
+}
+
+// Add function to create recording window
+function createRecordingWindow() {
+    if (recordingWindow) {
+        recordingWindow.show();
+        return;
+    }
+
+    recordingWindow = new BrowserWindow({
+        width: 300,
+        height: 72,
+        frame: false,
+        transparent: true,
+        resizable: false,
+        skipTaskbar: true,
+        alwaysOnTop: true,
+        hasShadow: true,
+        webPreferences: {
+            preload: path.join(__dirname, 'preload.js'),
+            contextIsolation: true,
+            nodeIntegration: false,
+        },
+        show: false,
+        type: process.platform === 'darwin' ? 'panel' : 'toolbar',
+        titleBarStyle: 'hidden',
+        vibrancy: 'menu',
+        visualEffectState: 'active'
+    });
+
+    recordingWindow.loadFile('recordingWindow.html');
+
+    // Position window at bottom center of screen
+    function positionWindow() {
+        // Get the display containing the cursor
+        const cursorPoint = screen.getCursorScreenPoint();
+        const display = screen.getDisplayNearestPoint(cursorPoint);
+        const workArea = display.workArea;
+        const windowBounds = recordingWindow.getBounds();
+
+        // Calculate position (centered horizontally, fixed distance from bottom)
+        const x = Math.round(workArea.x + (workArea.width / 2) - (windowBounds.width / 2));
+        const y = Math.round(workArea.y + workArea.height - windowBounds.height - 20); // 20px from bottom
+
+        // Ensure window stays within screen bounds horizontally
+        const adjustedX = Math.max(workArea.x, Math.min(x, workArea.x + workArea.width - windowBounds.width));
+        
+        recordingWindow.setPosition(adjustedX, y);
+    }
+
+    recordingWindow.on('ready-to-show', () => {
+        positionWindow();
+        recordingWindow.show();
+        recordingWindow.focus();
+    });
+
+    // Reposition window when screen metrics change
+    const handleDisplayChange = () => {
+        if (recordingWindow && !recordingWindow.isDestroyed()) {
+            positionWindow();
+        }
+    };
+    screen.on('display-metrics-changed', handleDisplayChange);
+    screen.on('display-added', handleDisplayChange);
+    screen.on('display-removed', handleDisplayChange);
+
+    // Clean up event listeners when window is closed
+    recordingWindow.on('closed', () => {
+        screen.removeListener('display-metrics-changed', handleDisplayChange);
+        screen.removeListener('display-added', handleDisplayChange);
+        screen.removeListener('display-removed', handleDisplayChange);
+        recordingWindow = null;
+    });
+}
+
+// Add audio visualization
+let audioVisualizationInterval = null;
+
+function startAudioVisualization() {
+    if (audioVisualizationInterval) return;
+    
+    audioVisualizationInterval = setInterval(() => {
+        if (recordingWindow && state.isRecording) {
+            const audioData = audioRecorder.getAudioData();
+            recordingWindow.webContents.send('audio-data', audioData);
+        }
+    }, 50); // Update every 50ms
+}
+
+function stopAudioVisualization() {
+    if (audioVisualizationInterval) {
+        clearInterval(audioVisualizationInterval);
+        audioVisualizationInterval = null;
+    }
+}
+
+// Clean up on app quit
+app.on('before-quit', () => {
+    stopAudioVisualization();
+});
+
+// Add theme change listener
+function setupThemeChangeListener() {
+    if (process.platform === 'darwin') {
+        systemPreferences.subscribeNotification(
+            'AppleInterfaceThemeChangedNotification',
+            () => {
+                const isDark = systemPreferences.isDarkMode();
+                if (recordingWindow) {
+                    recordingWindow.webContents.send('system-theme-change', isDark);
+                }
+            }
+        );
+    }
+}
+
+// Add IPC handler for closing the recording window
+ipcMain.on('close-recording-window', () => {
+    if (recordingWindow && !state.isRecording) {
+        recordingWindow.hide();
+    }
+});
+
+// Function to hide settings window with animation
+function hideSettingsWindow() {
+    if (!settingsWindow) return;
+    
+    // Update caret button state in recording window
+    recordingWindow?.webContents.send('settings-state-change', false);
+    
+    // Trigger hide animation
+    settingsWindow.webContents.send('before-hide');
+    
+    // Wait for animation to complete
+    setTimeout(() => {
+        if (settingsWindow) {
+            settingsWindow.hide();
+        }
+    }, 150); // Match the animation duration
+}
+
+// Add function to create settings window
+function createSettingsWindow() {
+    // Don't create if recording window doesn't exist
+    if (!recordingWindow) return;
+    
+    if (settingsWindow) {
+        settingsWindow.show();
+        return;
+    }
+
+    settingsWindow = new BrowserWindow({
+        width: 300,
+        height: 400,
+        frame: false,
+        transparent: true,
+        resizable: false,
+        skipTaskbar: true,
+        alwaysOnTop: true,
+        hasShadow: true,
+        webPreferences: {
+            preload: path.join(__dirname, 'preload.js'),
+            contextIsolation: true,
+            nodeIntegration: false,
+        },
+        show: false,
+        type: 'panel',
+        vibrancy: 'menu',
+        parent: recordingWindow, // Make recording window the parent
+    });
+
+    settingsWindow.loadFile('settingsPanel.html');
+
+    // Position window above recording window
+    function positionWindow() {
+        if (!recordingWindow || recordingWindow.isDestroyed()) {
+            settingsWindow?.close();
+            return;
+        }
+
+        const recordingBounds = recordingWindow.getBounds();
+        const settingsBounds = settingsWindow.getBounds();
+        
+        // Center horizontally relative to recording window
+        const x = Math.round(recordingBounds.x + (recordingBounds.width / 2) - (settingsBounds.width / 2));
+        
+        // Position above recording window with 8px gap (matching the arrow)
+        const y = Math.round(recordingBounds.y - settingsBounds.height - 8);
+
+        // Get the display where the recording window is located
+        const display = screen.getDisplayNearestPoint({
+            x: recordingBounds.x,
+            y: recordingBounds.y
+        });
+        const workArea = display.workArea;
+
+        // Ensure window stays within screen bounds
+        const adjustedX = Math.max(workArea.x, Math.min(x, workArea.x + workArea.width - settingsBounds.width));
+        const adjustedY = Math.max(workArea.y, Math.min(y, workArea.y + workArea.height - settingsBounds.height));
+
+        settingsWindow.setPosition(adjustedX, adjustedY);
+    }
+
+    settingsWindow.once('ready-to-show', () => {
+        positionWindow();
+        settingsWindow.show();
+        settingsWindow.focus();
+    });
+
+    // Hide settings when recording window moves
+    recordingWindow.on('move', () => {
+        positionWindow();
+    });
+
+    // Hide settings when recording window is hidden
+    recordingWindow.on('hide', () => {
+        settingsWindow?.hide();
+    });
+
+    settingsWindow.on('blur', () => {
+        if (!recordingWindow?.isFocused()) {
+            hideSettingsWindow();
+        }
+    });
+
+    settingsWindow.on('hide', () => {
+        if (settingsWindow) {
+            settingsWindow.destroy();
+        }
+        settingsWindow = null;
+    });
+}
+
+// Add IPC handlers for settings
+ipcMain.handle('get-settings', () => {
+    return store.store;
+});
+
+ipcMain.handle('update-settings', (_, changes) => {
+    // Deep merge changes with existing settings
+    const mergeChanges = (target, source) => {
+        Object.keys(source).forEach(key => {
+            if (source[key] && typeof source[key] === 'object') {
+                if (!target[key]) Object.assign(target, { [key]: {} });
+                mergeChanges(target[key], source[key]);
+            } else {
+                Object.assign(target, { [key]: source[key] });
+            }
+        });
+    };
+
+    const currentSettings = store.store;
+    mergeChanges(currentSettings, changes);
+    store.store = currentSettings;
+
+    // Notify all windows about the settings change
+    if (recordingWindow) {
+        recordingWindow.webContents.send('settings-change', store.store);
+    }
+    if (settingsWindow) {
+        settingsWindow.webContents.send('settings-change', store.store);
+    }
+
+    return store.store;
+});
+
+// Add IPC handler for toggling settings window
+ipcMain.on('toggle-settings', () => {
+    if (settingsWindow) {
+        hideSettingsWindow();
+    } else {
+        createSettingsWindow();
+        // Update caret button state in recording window
+        recordingWindow?.webContents.send('settings-state-change', true);
+    }
+});
+
+// Remove or update the existing open-settings handler
+ipcMain.on('open-settings', () => {
+    if (!settingsWindow) {
+        createSettingsWindow();
+    }
+});
+
+// Add IPC handler for toggling recording window
+ipcMain.on('toggle-recording-window', () => {
+    if (recordingWindow && recordingWindow.isVisible()) {
+        recordingWindow.hide();
+    } else {
+        createRecordingWindow();
+    }
+});
+
+// Add IPC handlers for recording
+ipcMain.on('start-recording', async () => {
+    try {
+        await audioRecorder.startRecording(tempRecordingPath);
+        setState({ isRecording: true, statusMessage: 'Recording...' });
+        recordingWindow?.webContents.send('recording-state-change', true);
+    } catch (error) {
+        console.error('Failed to start recording:', error);
+        dialog.showErrorBox('Recording Error', `Failed to start recording: ${error.message}`);
+    }
+});
+
+ipcMain.on('stop-recording', async () => {
+    try {
+        await stopRecording();
+        recordingWindow?.webContents.send('recording-state-change', false);
+    } catch (error) {
+        console.error('Failed to stop recording:', error);
+        dialog.showErrorBox('Recording Error', `Failed to stop recording: ${error.message}`);
+    }
+}); 

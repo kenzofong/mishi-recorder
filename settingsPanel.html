@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Settings</title>
+    <style>
+        :root {
+            --bg-color: rgba(255, 255, 255, 0.95);
+            --text-color: #000;
+            --border-color: rgba(0, 0, 0, 0.1);
+            --hover-bg: rgba(0, 0, 0, 0.05);
+            --active-color: #2196F3;
+            --switch-bg: #ccc;
+            --switch-active: #4CAF50;
+            --animation-timing: cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg-color: rgba(32, 32, 32, 0.95);
+                --text-color: #fff;
+                --border-color: rgba(255, 255, 255, 0.1);
+                --hover-bg: rgba(255, 255, 255, 0.1);
+                --active-color: #64B5F6;
+                --switch-bg: #555;
+                --switch-active: #66BB6A;
+            }
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+            background: var(--bg-color);
+            color: var(--text-color);
+            border-radius: 12px;
+            overflow: hidden;
+            user-select: none;
+            width: 300px;
+            backdrop-filter: blur(10px);
+            transform-origin: bottom center;
+            opacity: 0;
+            transform: translateY(20px) scale(0.95);
+            animation: slideIn 0.2s var(--animation-timing) forwards;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(20px) scale(0.95);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0) scale(1);
+            }
+        }
+
+        /* Add hide animation */
+        body.hiding {
+            animation: slideOut 0.15s var(--animation-timing) forwards;
+        }
+
+        @keyframes slideOut {
+            from {
+                opacity: 1;
+                transform: translateY(0) scale(1);
+            }
+            to {
+                opacity: 0;
+                transform: translateY(20px) scale(0.95);
+            }
+        }
+
+        /* Add a subtle arrow at the bottom with transition */
+        body::after {
+            content: '';
+            position: absolute;
+            bottom: -8px;
+            left: 50%;
+            transform: translateX(-50%) translateY(0);
+            width: 0;
+            height: 0;
+            border-left: 8px solid transparent;
+            border-right: 8px solid transparent;
+            border-top: 8px solid var(--bg-color);
+            filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.1));
+            transition: transform 0.2s var(--animation-timing);
+        }
+
+        body.hiding::after {
+            transform: translateX(-50%) translateY(-8px);
+        }
+
+        .container {
+            padding: 16px;
+        }
+
+        .section {
+            margin-bottom: 20px;
+        }
+
+        .section-title {
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 12px;
+            opacity: 0.8;
+        }
+
+        .setting-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .setting-row:last-child {
+            border-bottom: none;
+        }
+
+        .setting-label {
+            font-size: 13px;
+        }
+
+        /* Switch styles */
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 40px;
+            height: 20px;
+        }
+
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: var(--switch-bg);
+            transition: .3s;
+            border-radius: 20px;
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 16px;
+            width: 16px;
+            left: 2px;
+            bottom: 2px;
+            background-color: white;
+            transition: .3s;
+            border-radius: 50%;
+        }
+
+        input:checked + .slider {
+            background-color: var(--switch-active);
+        }
+
+        input:checked + .slider:before {
+            transform: translateX(20px);
+        }
+
+        /* Select styles */
+        .select-wrapper {
+            position: relative;
+            min-width: 120px;
+        }
+
+        select {
+            appearance: none;
+            background: transparent;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 4px 24px 4px 8px;
+            font-size: 13px;
+            color: var(--text-color);
+            width: 100%;
+            cursor: pointer;
+        }
+
+        .select-wrapper::after {
+            content: "▼";
+            font-size: 8px;
+            position: absolute;
+            right: 8px;
+            top: 50%;
+            transform: translateY(-50%);
+            pointer-events: none;
+            opacity: 0.5;
+        }
+
+        /* Preset styles */
+        .preset-button {
+            display: block;
+            width: 100%;
+            padding: 8px;
+            margin: 4px 0;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            background: transparent;
+            color: var(--text-color);
+            font-size: 13px;
+            cursor: pointer;
+            text-align: left;
+            transition: all 0.2s;
+        }
+
+        .preset-button:hover {
+            background: var(--hover-bg);
+        }
+
+        .preset-button.active {
+            border-color: var(--active-color);
+            background: var(--hover-bg);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="section">
+            <div class="section-title">Audio Input</div>
+            <div class="setting-row">
+                <span class="setting-label">Input Source</span>
+                <div class="select-wrapper">
+                    <select id="inputSource">
+                        <option value="system">System Audio</option>
+                        <option value="mic">Microphone</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-title">Audio Processing</div>
+            <div class="setting-row">
+                <span class="setting-label">Noise Reduction</span>
+                <label class="switch">
+                    <input type="checkbox" id="noiseReduction" checked>
+                    <span class="slider"></span>
+                </label>
+            </div>
+            <div class="setting-row">
+                <span class="setting-label">Loudness Normalization</span>
+                <label class="switch">
+                    <input type="checkbox" id="loudnessNorm" checked>
+                    <span class="slider"></span>
+                </label>
+            </div>
+            <div class="setting-row">
+                <span class="setting-label">Voice Activity Detection</span>
+                <label class="switch">
+                    <input type="checkbox" id="vad">
+                    <span class="slider"></span>
+                </label>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-title">Presets</div>
+            <button class="preset-button active" data-preset="meeting">
+                Meeting (Balanced)
+            </button>
+            <button class="preset-button" data-preset="voice">
+                Voice Focus
+            </button>
+            <button class="preset-button" data-preset="music">
+                Music Optimized
+            </button>
+        </div>
+    </div>
+    <script src="settingsPanel.js"></script>
+</body>
+</html> 
