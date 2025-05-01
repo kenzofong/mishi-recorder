@@ -5,6 +5,10 @@ const fs = require('fs');
 const { EventEmitter } = require('events');
 
 class AudioRecorder extends EventEmitter {
+    static cachedDevices = null;
+    static lastDeviceListUpdate = 0;
+    static CACHE_TTL = 5000; // 5 seconds TTL for cache
+
     constructor(settings) {
         super();
         this.isRecording = false;
@@ -16,11 +20,30 @@ class AudioRecorder extends EventEmitter {
         this.levelDetector = new LevelDetector();
         this.outputFilePath = null;
 
-        // Check FFmpeg availability
-        this.checkFFmpeg().catch(error => {
-            console.error('FFmpeg check failed:', error);
+        // Check FFmpeg availability and validate device
+        this.initialize().catch(error => {
+            console.error('AudioRecorder initialization failed:', error);
             this.emit('error', error);
         });
+    }
+
+    async initialize() {
+        // Check FFmpeg first
+        await this.checkFFmpeg();
+        
+        // Use cached devices if available
+        const devices = AudioRecorder.cachedDevices || await AudioRecorder.listMicrophones();
+        const device = this.settings.inputDevice;
+        
+        if (device.type === 'mic') {
+            const validDevice = devices.find(d => d.index === device.index);
+            if (!validDevice) {
+                throw new Error(`Invalid input device index: ${device.index}`);
+            }
+        }
+        
+        // If we get here, initialization was successful
+        this.emit('ready');
     }
 
     async checkFFmpeg() {
@@ -264,39 +287,124 @@ class AudioRecorder extends EventEmitter {
             return Promise.reject(new Error('Device listing is currently only supported on macOS'));
         }
 
+        // Return cached devices if within TTL
+        const now = Date.now();
+        if (AudioRecorder.cachedDevices && (now - AudioRecorder.lastDeviceListUpdate) < AudioRecorder.CACHE_TTL) {
+            console.log('Using cached device list');
+            return AudioRecorder.cachedDevices;
+        }
+
+        console.log('Fetching fresh device list...');
         return new Promise((resolve, reject) => {
-            ffmpeg.getAvailableFormats((err, formats) => {
-                if (err) {
-                    reject(err);
-                    return;
-                }
+            const process = spawn('ffmpeg', ['-f', 'avfoundation', '-list_devices', 'true', '-i', '']);
+            
+            let output = '';
+            let errorOutput = '';
 
-                // On macOS, list avfoundation devices
-                const process = spawn('ffmpeg', ['-f', 'avfoundation', '-list_devices', 'true', '-i', '']);
-                let devices = [];
+            process.stdout.on('data', (data) => {
+                output += data.toString();
+            });
 
-                process.stderr.on('data', (data) => {
-                    const lines = data.toString().split('\n');
-                    lines.forEach(line => {
-                        const match = line.match(/\[AVFoundation input device @ (.*)\] \[(.*)\] (.*)/);
-                        if (match && match[2] === 'input') {
-                                devices.push({
-                                index: devices.length,
-                                name: match[3].trim()
-                                });
+            process.stderr.on('data', (data) => {
+                errorOutput += data.toString();
+            });
+
+            process.on('error', (error) => {
+                reject(new Error(`Failed to list audio devices: ${error.message}`));
+            });
+
+            process.on('close', (code) => {
+                try {
+                    const fullOutput = output + errorOutput;
+                    const devices = [];
+                    const lines = fullOutput.split('\n');
+                    let isAudioSection = false;
+
+                    for (const line of lines) {
+                        if (line.includes('AVFoundation audio devices')) {
+                            isAudioSection = true;
+                            continue;
+                        }
+
+                        if (isAudioSection && line.includes('AVFoundation video devices')) {
+                            break;
+                        }
+
+                        if (isAudioSection && line.includes(']')) {
+                            const match = line.match(/\[(\d+)\]\s+([^\[]+?)(?:\s*\[.*\])?$/);
+                            if (match) {
+                                const index = parseInt(match[1], 10);
+                                const name = match[2].trim();
+                                
+                                if (name && 
+                                    !name.toLowerCase().includes('display') && 
+                                    !name.toLowerCase().includes('screen')) {
+                                    devices.push({ index, name });
+                                }
                             }
-                    });
-                });
+                        }
+                    }
 
-                process.on('close', () => {
+                    // Update cache
+                    AudioRecorder.cachedDevices = devices;
+                    AudioRecorder.lastDeviceListUpdate = now;
+                    
                     resolve(devices);
-                });
-
-                process.on('error', (error) => {
+                } catch (error) {
+                    console.error('Error parsing FFmpeg output:', error);
                     reject(error);
-                });
+                }
             });
         });
+    }
+
+    static listMicrophonesSync() {
+        try {
+            // Return cached devices if within TTL
+            const now = Date.now();
+            if (AudioRecorder.cachedDevices && (now - AudioRecorder.lastDeviceListUpdate) < AudioRecorder.CACHE_TTL) {
+                console.log('Using cached device list for sync call');
+                return AudioRecorder.cachedDevices;
+            }
+
+            console.log('Fetching fresh device list synchronously...');
+            const { spawnSync } = require('child_process');
+            const result = spawnSync('ffmpeg', ['-f', 'avfoundation', '-list_devices', 'true', '-i', '']);
+            
+            const output = result.stderr.toString();
+            const devices = [];
+            let isAudioSection = false;
+            
+            output.split('\n').forEach(line => {
+                if (line.includes('AVFoundation audio devices:')) {
+                    isAudioSection = true;
+                    return;
+                }
+                
+                if (isAudioSection) {
+                    const match = line.match(/\[(\d+)\]\s+(.+)/);
+                    if (match) {
+                        const index = parseInt(match[1]);
+                        const name = match[2].trim();
+                        if (name && 
+                            !name.toLowerCase().includes('display') && 
+                            !name.toLowerCase().includes('screen')) {
+                            devices.push({ index, name });
+                        }
+                    }
+                }
+            });
+
+            // Update cache
+            AudioRecorder.cachedDevices = devices;
+            AudioRecorder.lastDeviceListUpdate = now;
+            
+            return devices;
+        } catch (error) {
+            console.error('Error listing microphones:', error);
+            // Return cached devices if available, empty array otherwise
+            return AudioRecorder.cachedDevices || [];
+        }
     }
 
     /**
