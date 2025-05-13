@@ -1,15 +1,42 @@
 const { app, Tray, Menu, nativeImage, ipcMain, BrowserWindow, shell, dialog, systemPreferences, screen } = require('electron');
 const path = require('path');
 const os = require('os');
-require('dotenv').config(); // Load .env file variables into process.env
 const Store = require('electron-store');
 const { createClient } = require('@supabase/supabase-js');
 const fs = require('fs');
 const { google } = require('googleapis');
 const { OAuth2Client } = require('google-auth-library');
 const AudioRecorder = require('./audioRecorder');
-const MishiIntegration = require('./mishiIntegration');
+const mishiServiceModule = require('./src/main/mishiService');
 const sharp = require('sharp'); // Add this at the top with other imports
+const {
+    createTray,
+    createTrayFallback,
+    recreateTray,
+    updateTrayMenu,
+    buildContextMenuTemplate
+} = require('./src/main/tray');
+// Import config values and validation from src/main/config.js
+const {
+    SUPABASE_URL,
+    SUPABASE_ANON_KEY,
+    SUPABASE_SERVICE_ROLE_KEY,
+    MISHI_WEB_APP_URL,
+    TEMP_RECORDING_FILENAME,
+    OAUTH_CALLBACK_WINDOW_OPTIONS,
+    validateConfig
+} = require('./src/main/config');
+const { createAndShowLoginWindow, createSettingsWindow, hideSettingsWindow, createRecordingWindow } = require('./src/main/windows');
+const { setupIPCHandlers } = require('./src/main/ipcHandlers');
+const { getState, setState, stateEmitter } = require('./src/main/state');
+const { withTimeout } = require('./src/main/utils');
+const trayManager = require('./src/main/tray');
+const windowManager = require('./src/main/windows');
+const authService = require('./src/main/auth');
+const recordingServiceModule = require('./src/main/recording');
+const { authEvents } = require('./src/main/auth');
+// Validate config at startup
+validateConfig();
 // Single instance lock to prevent multiple tray icons
 const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) {
@@ -19,21 +46,6 @@ if (!gotTheLock) {
 
 // --- Configuration ---
 // Load from environment variables (dotenv will load from .env file)
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const MISHI_WEB_APP_URL = process.env.MISHI_WEB_APP_URL;
-const TEMP_RECORDING_FILENAME = 'temp_recording.wav';
-
-// Add this near other constants
-const OAUTH_CALLBACK_WINDOW_OPTIONS = {
-    width: 1024,
-    height: 768,
-    webPreferences: {
-        nodeIntegration: false,
-        contextIsolation: true
-    }
-};
 
 // --- Globals ---
 let tray = null;
@@ -45,7 +57,7 @@ const store = new Store({
         inputDevice: {
             type: 'object',
             properties: {
-                type: { type: 'string', enum: ['system', 'mic'], default: 'mic' },
+                type: { type: 'string', enum: ['system', 'mic', 'avfoundation'], default: 'mic' },
                 index: { type: 'number', default: 0 },
                 name: { type: 'string', default: 'Default Microphone' }
             },
@@ -77,17 +89,6 @@ const oauth2Client = new OAuth2Client({
     redirectUri: 'https://localhost'  // We'll handle the redirect in the auth window
 });
 
-// --- Application State ---
-let state = {
-    isLoggedIn: false,
-    isRecording: false,
-    statusMessage: 'Starting...',
-    user: null,
-    transcriptionStatus: null,
-    currentMeeting: null,
-    workspace: null  // Add workspace info to state
-};
-
 // Track app ready state
 let isAppReady = false;
 
@@ -106,20 +107,11 @@ let isIPCSetup = false;
 let isInitializing = false;
 let lastInitializedUserId = null;
 let hasCompletedInitialSetup = false;
-let hasCreatedTray = false; // Flag to prevent duplicate tray creation
+let hasCheckedInitialSession = false;
+let loginWindowShown = false;
+let loginWindowTimeout = null;
 
 // --- Initialization ---
-
-// Add checks for missing environment variables
-if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !MISHI_WEB_APP_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    console.error("FATAL ERROR: Required environment variables not found.");
-    console.error("Please ensure you have a .env file with all required variables defined:");
-    console.error("- SUPABASE_URL");
-    console.error("- SUPABASE_ANON_KEY");
-    console.error("- SUPABASE_SERVICE_ROLE_KEY");
-    console.error("- MISHI_WEB_APP_URL");
-    app.quit();
-}
 
 // --- Electron App Lifecycle ---
 app.on('ready', async () => {
@@ -133,13 +125,20 @@ app.on('ready', async () => {
     }
     try {
         // Initialize Mishi Integration first
-        mishiIntegration = new MishiIntegration({
+        mishiIntegration = mishiServiceModule.initMishiService({
             supabaseUrl: SUPABASE_URL,
             supabaseKey: SUPABASE_SERVICE_ROLE_KEY,
             anonKey: SUPABASE_ANON_KEY,
             webAppUrl: MISHI_WEB_APP_URL
         });
         console.log("Mishi integration initialized successfully");
+
+        // Initialize authService (Supabase client for auth.js)
+        authService.initAuth({
+            storeInstance: store,
+            mishiServiceInstance: mishiIntegration,
+            setStateFn: setState,
+        });
 
         // Initialize Supabase Client
         supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
@@ -163,14 +162,72 @@ app.on('ready', async () => {
         });
         console.log("Supabase client initialized successfully");
 
+        // Initialize the recording service before creating the tray
+        console.log('[main.js] Calling recordingServiceModule.initRecordingService');
+        recordingServiceModule.initRecordingService({
+            store,
+            mishiService: mishiIntegration,
+            supabase,
+            getState,
+            setState,
+            TEMP_RECORDING_FILENAME
+        });
+
         // Create tray *after* initial setup and checks
-        // await createTray(); // Keep this commented/removed as it was moved below
-        
-        // Initialize AudioRecorder
-        initializeAudioRecorder();
+        console.log('[main.js] Calling trayManager.initializeTray');
+        await trayManager.initializeTray(getState(), store, {
+            startRecording: recordingServiceModule.startRecording,
+            stopRecording: recordingServiceModule.stopRecording,
+            updateAudioDevice: recordingServiceModule.updateAudioDevice,
+            showLoginWindow: () => windowManager.showLoginWindow({
+                preloadPath: path.join(__dirname, 'preload.js'),
+                loginHtmlPath: path.join(__dirname, 'login.html')
+            }),
+            toggleSettingsPanel: () => windowManager.toggleSettingsPanel({
+                recordingWindow: null, // Should be managed by windowManager
+                preloadPath: path.join(__dirname, 'preload.js'),
+                settingsHtmlPath: path.join(__dirname, 'settingsPanel.html'),
+                screen,
+                onHide: () => {}
+            }),
+            logout: authService.logout,
+            ensureRecordingWindow: () => {
+                global.recordingWindow = windowManager.ensureRecordingWindow({
+                    preloadPath: path.join(__dirname, 'preload.js'),
+                    recordingHtmlPath: path.join(__dirname, 'recordingWindow.html'),
+                    state: getState(),
+                    onClose: () => { global.recordingWindow = null; }
+                });
+                console.log('[main.js] ensureRecordingWindow: global.recordingWindow =', global.recordingWindow);
+                if (global.recordingWindow && !global.recordingWindow.isDestroyed()) {
+                    global.recordingWindow.webContents.send('recording-state-change', getState().isRecording);
+                }
+            }
+        });
 
         // Initialize IPC Listeners
-        setupIPCListeners();
+        setupIPCHandlers({
+            state: getState(),
+            getState,
+            store,
+            audioRecorder,
+            tempRecordingPath,
+            setState,
+            startRecording: recordingServiceModule.startRecording,
+            stopRecording: recordingServiceModule.stopRecording,
+            cleanupRecording: recordingServiceModule.cleanupRecording,
+            recordingWindow,
+            settingsWindow,
+            createAndShowLoginWindow,
+            createSettingsWindow,
+            hideSettingsWindow,
+            createRecordingWindow: recordingServiceModule.createRecordingWindow,
+            updateAudioDevice: recordingServiceModule.updateAudioDevice,
+            isStoppingRecording,
+            mishiIntegration,
+            supabase,
+            authService,
+        });
 
         // Set up auth state change listener
         supabase.auth.onAuthStateChange(async (event, session) => {
@@ -193,6 +250,11 @@ app.on('ready', async () => {
                 setState({ statusMessage: 'Error: Session check failed' });
             } else if (session) {
                 console.log("Found existing session");
+                setState({
+                    isLoggedIn: true,
+                    user: session.user,
+                    statusMessage: 'Idle'
+                });
             } else {
                 console.log("No active session found");
                 setState({ 
@@ -207,7 +269,23 @@ app.on('ready', async () => {
 
         // Create tray *after* other initial setup
         console.log('[Ready Handler End] Attempting tray creation...');
-        await createTray(); 
+        await trayManager.initializeTray(getState(), store, {
+            startRecording: recordingServiceModule.startRecording,
+            stopRecording: recordingServiceModule.stopRecording,
+            updateAudioDevice: recordingServiceModule.updateAudioDevice,
+            showLoginWindow: () => windowManager.showLoginWindow({
+                preloadPath: path.join(__dirname, 'preload.js'),
+                loginHtmlPath: path.join(__dirname, 'login.html')
+            }),
+            toggleSettingsPanel: () => windowManager.toggleSettingsPanel({
+                recordingWindow: null, // Should be managed by windowManager
+                preloadPath: path.join(__dirname, 'preload.js'),
+                settingsHtmlPath: path.join(__dirname, 'settingsPanel.html'),
+                screen,
+                onHide: () => {}
+            }),
+            logout: authService.logout
+        }); 
 
     } catch (error) {
         console.error("Critical initialization error:", error);
@@ -222,883 +300,147 @@ app.on('ready', async () => {
 
 // --- Tray Setup ---
 
-async function createTray() {
-    if (hasCreatedTray) {
-        return;
-    }
-    console.log('createTray() called');
-    // Always destroy previous tray before creating a new one
-    if (tray) {
-        try {
-            tray.destroy();
-        } catch (e) {
-            console.warn('Error destroying previous tray:', e);
-        }
-        tray = null;
-    }
-
-    console.log("Creating tray icon...");
-    const svgPath = path.join(__dirname, 'assets', 'favicon.svg');
-    let icon = null;
-    try {
-        if (fs.existsSync(svgPath)) {
-            console.log('SVG file exists, proceeding with conversion...');
-            const svgBuffer = fs.readFileSync(svgPath);
-            let pngBuffer;
-            try {
-                pngBuffer = await sharp(svgBuffer).resize(24, 24).png().toBuffer();
-            } catch (err) {
-                console.error('Error converting SVG to PNG:', err);
-                throw err;
-            }
-            icon = nativeImage.createFromBuffer(pngBuffer);
-            if (icon.isEmpty()) {
-                throw new Error('Converted tray icon is empty');
-            }
-            tray = new Tray(icon);
-            tray.setToolTip('Mishi Recorder');
-            updateTrayMenu();
-            hasCreatedTray = true; // Set flag after successful creation
-            console.log("Tray created successfully with SVG icon");
-        } else {
-            console.error(`SVG icon file not found at ${svgPath}`);
-            throw new Error('Tray SVG icon file not found');
-        }
-    } catch (error) {
-        console.error("Error creating tray with SVG:", error);
-        // Fallback to old icon
-        createTrayFallback();
-    }
-}
-
-function createTrayFallback() {
-    if (hasCreatedTray) {
-        return;
-    }
-    console.log('Proceeding with fallback tray creation...'); // Keep a simple log
-    try {
-        const iconPath = path.join(__dirname, 'assets', 'iconTemplate.png');
-        if (!fs.existsSync(iconPath)) {
-            throw new Error('Tray icon file not found');
-        }
-        const icon = nativeImage.createFromPath(iconPath);
-        if (icon.isEmpty()) {
-            throw new Error('Failed to load tray icon');
-        }
-        tray = new Tray(icon);
-        tray.setToolTip('Mishi Recorder (Fallback Mode)');
-        updateTrayMenu();
-        hasCreatedTray = true; // Set flag after successful creation
-        console.log("Created tray with fallback icon");
-    } catch (fallbackError) {
-        console.error("Critical: Failed to create tray even with fallback:", fallbackError);
-        dialog.showErrorBox(
-            'Tray Creation Failed',
-            'Failed to create application tray icon. The application may not function correctly.'
-        );
-    }
-}
-
-// Add a function to destroy and recreate tray (can be useful for debugging)
-function recreateTray() {
-    if (tray) {
-        console.log("Destroying existing tray...");
-        tray.destroy();
-        tray = null;
-    }
-}
-
 if (process.platform === 'darwin') {
     // On macOS, recreate tray when activating the app
     app.on('activate', () => {
         if (!tray) {
             console.log("No tray detected on activate, recreating...");
-            createTray();
+            trayManager.initializeTray(getState(), store, {
+                startRecording: recordingServiceModule.startRecording,
+                stopRecording: recordingServiceModule.stopRecording,
+                updateAudioDevice: recordingServiceModule.updateAudioDevice,
+                showLoginWindow: () => windowManager.showLoginWindow({
+             preloadPath: path.join(__dirname, 'preload.js'),
+             loginHtmlPath: path.join(__dirname, 'login.html')
+                }),
+                toggleSettingsPanel: () => windowManager.toggleSettingsPanel({
+                    recordingWindow: null, // Should be managed by windowManager
+                    preloadPath: path.join(__dirname, 'preload.js'),
+                    settingsHtmlPath: path.join(__dirname, 'settingsPanel.html'),
+                    screen,
+                    onHide: () => {}
+                }),
+                logout: authService.logout
+            });
         }
     });
-}
-
-function updateTrayMenu() {
-    if (!tray) {
-        console.log("Cannot update tray menu - tray not initialized");
-        return;
-    }
-
-    console.log("Updating tray menu with state:", {
-        isLoggedIn: state.isLoggedIn,
-        statusMessage: state.statusMessage,
-        isRecording: state.isRecording,
-        hasCurrentMeeting: !!state.currentMeeting
-    });
-
-    const contextMenu = Menu.buildFromTemplate(buildContextMenuTemplate());
-    tray.setContextMenu(contextMenu);
-}
-
-function buildContextMenuTemplate() {
-    console.log("Building menu template with state:", {
-        isLoggedIn: state.isLoggedIn,
-        statusMessage: state.statusMessage
-    });
-
-    const menuTemplate = [];
-
-    if (state.isLoggedIn) {
-        // Primary actions
-        menuTemplate.push(
-            { 
-                label: 'Open Web App', 
-                click: async () => {
-                    try {
-                        const url = await mishiIntegration.openInWebApp(state.user.id);
-                        shell.openExternal(url);
-                    } catch (error) {
-                        console.error('Failed to open web app:', error);
-                        dialog.showErrorBox('Error', `Failed to open web app: ${error.message}`);
-                    }
-                }
-            },
-            { 
-                label: 'New Meeting', 
-                click: async () => {
-                    createRecordingWindow();
-                    // Wait for the window to be ready before starting recording
-                    if (recordingWindow) {
-                        recordingWindow.once('ready-to-show', async () => {
-                            await startRecording();
-                            recordingWindow?.webContents.send('recording-state-change', true);
-                        });
-                    }
-                }, 
-                enabled: !state.isRecording && state.statusMessage !== 'Uploading' 
-            },
-            { type: 'separator' },
-            
-            // Settings submenu
-            {
-                label: 'Settings',
-                submenu: [
-                    {
-                        label: `Current Input: ${store.get('inputDevice').name || 'Default Microphone'}`,
-                        enabled: false
-                    },
-                    { type: 'separator' }
-                ]
-            }
-        );
-
-        // Get available audio devices
-        const devices = AudioRecorder.listMicrophonesSync() || [];
-        
-        // Add system audio option for macOS to the settings submenu
-        if (process.platform === 'darwin') {
-            menuTemplate[menuTemplate.length - 1].submenu.push({
-                label: 'System Audio (requires BlackHole)',
-                type: 'radio',
-                checked: store.get('inputDevice').type === 'system',
-                click: async () => {
-                    try {
-                        await updateAudioDevice({
-                            type: 'system',
-                            index: 0,
-                            name: 'System Audio'
-                        });
-                    } catch (error) {
-                        console.error('Error selecting system audio:', error);
-                        dialog.showErrorBox('Device Selection Error', `Failed to select system audio: ${error.message}`);
-                    }
-                }
-            });
-        }
-
-        // Add available microphones to settings submenu
-        if (devices.length > 0) {
-            devices.forEach(device => {
-                menuTemplate[menuTemplate.length - 1].submenu.push({
-                    label: device.name,
-                    type: 'radio',
-                    checked: store.get('inputDevice').type === 'mic' && store.get('inputDevice').index === device.index,
-                    click: async () => {
-                        try {
-                            await updateAudioDevice({
-                                type: 'mic',
-                                index: device.index,
-                                name: device.name
-                            });
-                        } catch (error) {
-                            console.error('Error selecting device:', error);
-                            dialog.showErrorBox('Device Selection Error', `Failed to select ${device.name}: ${error.message}`);
-                        }
-                    }
-                });
-            });
-        } else {
-            menuTemplate[menuTemplate.length - 1].submenu.push({
-                label: 'No microphones found',
-                enabled: false
-            });
-        }
-
-        // Add separator and logout to settings submenu
-        menuTemplate[menuTemplate.length - 1].submenu.push(
-            { type: 'separator' },
-            { label: 'Log Out', click: logout }
-        );
-
-        // Add separator after settings
-        menuTemplate.push({ type: 'separator' });
-
-        // User info section
-        if (state.user) {
-            menuTemplate.push(
-                { 
-                    label: `${state.user.email}`, 
-                    enabled: false,
-                    icon: state.user.user_metadata?.avatar_url ? nativeImage.createFromDataURL(state.user.user_metadata.avatar_url).resize({ width: 16, height: 16 }) : null
-                }
-            );
-        }
-        if (state.workspace) {
-            menuTemplate.push({ 
-                label: `Workspace: ${state.workspace.name}`, 
-                enabled: false 
-            });
-        }
-
-        // Final actions
-        menuTemplate.push(
-            { type: 'separator' },
-            { label: 'Quit', click: quitApp }
-        );
-    } else {
-        // Not logged in state
-        menuTemplate.push(
-            { label: 'Login', click: openLoginWindow },
-            { type: 'separator' },
-            { label: 'Quit', click: quitApp }
-        );
-    }
-
-    return menuTemplate;
 }
 
 // --- State Management ---
 
-function setState(newState) {
-    const oldState = { ...state };
-    state = { ...state, ...newState };
-    console.log("State changed:", {
-        from: {
-            isLoggedIn: oldState.isLoggedIn,
-            statusMessage: oldState.statusMessage,
-            userId: oldState.user?.id
-        },
-        to: {
-            isLoggedIn: state.isLoggedIn,
-            statusMessage: state.statusMessage,
-            userId: state.user?.id
+// Listen for login state changes to handle UI transitions
+stateEmitter.on('change', ({ oldState, newState }) => {
+    console.log('[stateEmitter] State changed:', { oldState, newState });
+    // Delay showing login window after initial session check to avoid flashing
+    if (hasCheckedInitialSession && !newState.isLoggedIn && !loginWindowShown && !loginWindowTimeout) {
+        loginWindowTimeout = setTimeout(() => {
+            if (!getState().isLoggedIn && !loginWindowShown) {
+                if (windowManager && windowManager.showLoginWindow) {
+                    console.log('[stateEmitter] Not logged in after session check (delayed), showing login window.');
+                    windowManager.showLoginWindow({
+             preloadPath: path.join(__dirname, 'preload.js'),
+             loginHtmlPath: path.join(__dirname, 'login.html')
+         });
+                    loginWindowShown = true;
+                }
+            }
+            loginWindowTimeout = null;
+        }, 150); // 150ms delay
+    }
+    if (newState.isLoggedIn && !oldState.isLoggedIn) {
+        console.log('[stateEmitter] Detected isLoggedIn=true, closing login window.');
+        if (windowManager && windowManager.closeLoginWindow) {
+            console.log('[stateEmitter] Calling windowManager.closeLoginWindow()');
+            windowManager.closeLoginWindow();
         }
-    });
-    
-    if (isAppReady) {
-        // Ensure tray exists before updating menu
-        // DO NOT call createTray() here. updateTrayMenu handles if tray is null.
-        updateTrayMenu();
+        loginWindowShown = false; // Reset for next logout/login cycle
+        if (loginWindowTimeout) {
+            clearTimeout(loginWindowTimeout);
+            loginWindowTimeout = null;
+        }
+        // Show the dock bar when logged in
+        if (windowManager && windowManager.createDockBarWindow) {
+            windowManager.createDockBarWindow({
+                preloadPath: path.join(__dirname, 'preload.js')
+            });
+        }
     }
-    
-    if (state.isRecording) {
-        startAudioVisualization();
-    } else {
-        stopAudioVisualization();
+    // Hide the dock bar when logging out
+    if (!newState.isLoggedIn && oldState.isLoggedIn) {
+        if (global.dockBarWindow && !global.dockBarWindow.isDestroyed()) {
+            global.dockBarWindow.close();
+            global.dockBarWindow = null;
+        }
     }
-}
+    // Show recording window only when recording starts
+    if (!oldState.isRecording && newState.isRecording) {
+        console.log('[stateEmitter] Recording started, showing recording window.');
+        if (windowManager && windowManager.ensureRecordingWindow) {
+            global.recordingWindow = windowManager.ensureRecordingWindow({
+                preloadPath: path.join(__dirname, 'preload.js'),
+                recordingHtmlPath: path.join(__dirname, 'recordingWindow.html'),
+                state: newState,
+                onClose: () => { global.recordingWindow = null; }
+            });
+            // Always send the current recording state after creating the window
+            if (global.recordingWindow && !global.recordingWindow.isDestroyed()) {
+                global.recordingWindow.webContents.send('recording-state-change', getState().isRecording);
+            }
+        }
+        // Send recording-state-change to the recording window (redundant, but safe)
+        if (global.recordingWindow && !global.recordingWindow.isDestroyed()) {
+            console.log('[main.js] Sending recording-state-change: true');
+            global.recordingWindow.webContents.send('recording-state-change', true);
+        }
+    }
+    // Hide recording window when recording stops
+    if (oldState.isRecording && !newState.isRecording) {
+        console.log('[stateEmitter] Recording stopped, hiding recording window.');
+        if (windowManager && windowManager.closeRecordingWindow) {
+            windowManager.closeRecordingWindow();
+        }
+        // Send recording-state-change to the recording window
+        if (global.recordingWindow && !global.recordingWindow.isDestroyed()) {
+            console.log('[main.js] Sending recording-state-change: false');
+            global.recordingWindow.webContents.send('recording-state-change', false);
+        }
+    }
+    // Always update the tray menu on state change
+    if (trayManager && trayManager.updateTray) {
+        console.log('[stateEmitter] Calling trayManager.updateTray() with state:', newState);
+        trayManager.updateTray(newState, {
+            startRecording: recordingServiceModule.startRecording,
+            stopRecording: recordingServiceModule.stopRecording,
+            updateAudioDevice: recordingServiceModule.updateAudioDevice,
+            showLoginWindow: () => windowManager.showLoginWindow({
+                preloadPath: path.join(__dirname, 'preload.js'),
+                loginHtmlPath: path.join(__dirname, 'login.html')
+            }),
+            toggleSettingsPanel: () => windowManager.toggleSettingsPanel({
+                recordingWindow: null, // Should be managed by windowManager
+                preloadPath: path.join(__dirname, 'preload.js'),
+                settingsHtmlPath: path.join(__dirname, 'settingsPanel.html'),
+                screen,
+                onHide: () => {}
+            }),
+            logout: authService.logout,
+            ensureRecordingWindow: () => {
+                global.recordingWindow = windowManager.ensureRecordingWindow({
+                    preloadPath: path.join(__dirname, 'preload.js'),
+                    recordingHtmlPath: path.join(__dirname, 'recordingWindow.html'),
+                    state: getState(),
+                    onClose: () => { global.recordingWindow = null; }
+                });
+                console.log('[main.js] ensureRecordingWindow: global.recordingWindow =', global.recordingWindow);
+                if (global.recordingWindow && !global.recordingWindow.isDestroyed()) {
+                    global.recordingWindow.webContents.send('recording-state-change', getState().isRecording);
+                }
+            }
+        });
+    }
+});
 
 // --- Core Functionality (Placeholders) ---
-
-function openLoginWindow() {
-    console.log("Requesting login window via IPC...");
-    // Instead of opening directly, send a message to potentially create/focus it
-    // This assumes setupIPCListeners() is called on app ready
-    app.emit('open-login-window'); // Use app event emitter or call setupIPCListeners directly first
-    // Alternative: Directly call the window creation logic if IPC isn't strictly needed *here*
-    // For simplicity now, let's call the IPC handler logic directly
-    if (typeof setupIPCListeners === 'function') {
-         // This isn't ideal, refactor needed if complex window mgmt arises
-         // Find the handler logic for 'open-login-window' if needed
-         console.warn("Directly triggering window opening logic - refactor recommended");
-         createAndShowLoginWindow(); // Extracted logic below
-    } else {
-         setState({ statusMessage: 'Error: IPC not setup' });
-    }
-
-}
-
-async function fakeLogin() { // Example for testing UI flow without full auth
-    console.log("Attempting fake login...");
-    setState({ statusMessage: 'Logging in...' });
-    await new Promise(resolve => setTimeout(resolve, 1500)); // Simulate network delay
-    setState({ isLoggedIn: true, user: { email: 'test@example.com'}, statusMessage: 'Idle' });
-    console.log("Fake login successful");
-}
-
-
-async function login(email, password) {
-    console.log(`Attempting login for: ${email}`);
-    setState({ statusMessage: 'Logging in...' });
-    if (!supabase) {
-        setState({ statusMessage: 'Error: Supabase not initialized' });
-        return { success: false, error: 'Supabase client unavailable.' };
-    }
-    try {
-        const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-        if (error) {
-            throw error;
-        }
-
-        // Get fresh session data immediately after login
-        const { data: { session: freshSession }, error: refreshError } = await supabase.auth.getSession();
-        if (refreshError) throw refreshError;
-        if (!freshSession) throw new Error('No session available after login');
-
-        // Initialize Mishi integration with fresh session
-        try {
-            const workspaceId = await mishiIntegration.initialize(
-                freshSession.user.id, 
-                freshSession.access_token,
-                freshSession.refresh_token
-            );
-
-            // Fetch workspace details
-            const { data: workspace, error: workspaceError } = await supabase
-                .from('workspaces')
-                .select('*')
-                .eq('id', workspaceId)
-                .single();
-
-            if (workspaceError) throw workspaceError;
-
-            console.log("Mishi integration initialized with workspace after login");
-            setState({ 
-                isLoggedIn: true, 
-                user: freshSession.user, 
-                statusMessage: 'Idle',
-                workspace: workspace
-            });
-
-            // Notify renderer of successful login
-            if (loginWindow && !loginWindow.isDestroyed()) {
-                loginWindow.webContents.send('login-success');
-                // Wait a brief moment before closing to ensure the success message is received
-                setTimeout(() => {
-                    loginWindow.close();
-                    loginWindow = null;
-                }, 500);
-            }
-
-            return { success: true };
-        } catch (mishiError) {
-            console.error("Failed to initialize workspace:", mishiError.message);
-            setState({ statusMessage: `Error: Failed to initialize workspace - ${mishiError.message}` });
-            return { success: false, error: mishiError.message };
-        }
-    } catch (error) {
-        console.error('Login error:', error.message);
-        return { success: false, error: error.message };
-    }
-}
-
-async function logout() {
-    console.log("Logging out...");
-    setState({ statusMessage: 'Logging out...' });
-    
-    if (!supabase) {
-        setState({ statusMessage: 'Error: Supabase not initialized' });
-        return;
-    }
-
-    try {
-        // Clean up Mishi integration first
-        if (mishiIntegration) {
-            console.log("Cleaning up Mishi integration...");
-            await mishiIntegration.cleanup();
-        }
-
-        // Sign out from Supabase with timeout
-        console.log("Signing out from Supabase...");
-        const signOutPromise = supabase.auth.signOut();
-        const timeoutPromise = new Promise((_, reject) => {
-            setTimeout(() => reject(new Error('Supabase signOut timed out after 5 seconds')), 5000);
-        });
-
-        try {
-            const { error } = await Promise.race([signOutPromise, timeoutPromise]);
-            if (error) throw error;
-            console.log("Supabase logout successful");
-        } catch (signOutError) {
-            console.error("Supabase signOut error or timeout:", signOutError.message);
-            // Continue with cleanup even if signOut times out
-        }
-
-        // Clear electron-store
-        console.log("Clearing stored session data...");
-        store.delete('sb-access-token');
-        store.delete('sb-refresh-token');
-        
-        // Reset Supabase client
-        supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-            auth: {
-                storage: electronStoreAdapter,
-                autoRefreshToken: true,
-                persistSession: true,
-                detectSessionInUrl: false,
-                flowType: 'pkce'
-            }
-        });
-
-    } catch (error) {
-        console.error("Logout failed:", error.message);
-        // Still proceed with client-side logout
-    } finally {
-        // Clear local state regardless of Supabase success/failure
-        setState({ 
-            isLoggedIn: false, 
-            user: null, 
-            isRecording: false, 
-            statusMessage: 'Idle',
-            transcriptionStatus: null,
-            currentMeeting: null,
-            workspace: null
-        });
-
-        // Close any open windows
-        BrowserWindow.getAllWindows().forEach(window => {
-            if (!window.isDestroyed()) {
-                window.close();
-            }
-        });
-
-        // Update tray menu
-        updateTrayMenu();
-    }
-}
-
-// Initialize AudioRecorder with settings from store
-function initializeAudioRecorder() {
-    try {
-        const settings = {
-            inputDevice: store.get('inputDevice') || { type: 'mic', index: 0, name: 'Default Microphone' }
-        };
-        console.log('Initializing audio recorder with settings:', settings);
-
-        // Clean up existing recorder if it exists
-        if (audioRecorder) {
-            try {
-                audioRecorder.removeAllListeners();
-                if (audioRecorder.isCurrentlyRecording()) {
-                    audioRecorder.stopRecording().catch(err => {
-                        console.error('Error stopping recording during cleanup:', err);
-                    });
-                }
-            } catch (err) {
-                console.error('Error cleaning up existing recorder:', err);
-            }
-        }
-
-        audioRecorder = new AudioRecorder(settings);
-
-        audioRecorder.on('audioData', (data) => {
-            try {
-                if (recordingWindow && !recordingWindow.isDestroyed()) {
-                    recordingWindow.webContents.send('audio-data', data);
-                }
-            } catch (err) {
-                console.error('Error sending audio data to window:', err);
-            }
-        });
-
-        audioRecorder.on('error', (error) => {
-            console.error('Audio recorder error:', error);
-            dialog.showErrorBox('Audio Error', `Recording error: ${error.message}`);
-        });
-
-        console.log('Audio recorder initialized successfully');
-    } catch (error) {
-        console.error('Failed to initialize audio recorder:', error);
-        dialog.showErrorBox('Initialization Error', `Failed to initialize audio recorder: ${error.message}`);
-    }
-}
-
-async function startRecording() {
-    try {
-        if (!state.isLoggedIn) {
-            throw new Error('Please log in first');
-        }
-
-        // Generate default meeting title with current date
-        const today = new Date();
-        const month = (today.getMonth() + 1).toString().padStart(2, '0');
-        const day = today.getDate().toString().padStart(2, '0');
-        const year = today.getFullYear();
-        const title = `Meeting ${month}/${day}/${year}`;
-
-        // Ensure temp recording path exists
-        if (!tempRecordingPath) {
-            tempRecordingPath = path.join(app.getPath('userData'), TEMP_RECORDING_FILENAME);
-        }
-
-        // Start a new meeting with the user ID
-        const meeting = await mishiIntegration.startRecordingSession(title, state.user.id);
-        if (!meeting) {
-            throw new Error('Failed to create meeting session');
-        }
-
-        // Start recording audio
-        await audioRecorder.startRecording(tempRecordingPath);
-        
-        // Only update state after both operations succeed
-        setState({ 
-            isRecording: true, 
-            statusMessage: 'Recording...', 
-            currentMeeting: meeting 
-        });
-        
-        updateTrayMenu();
-    } catch (error) {
-        console.error('Failed to start recording:', error);
-        setState({ 
-            isRecording: false, 
-            statusMessage: `Error: ${error.message}`,
-            currentMeeting: null 
-        });
-        updateTrayMenu();
-    }
-}
-
-// Add helper function to delete the temporary file
-function cleanupTempFile(filePath, reason) {
-    if (!filePath) {
-        console.warn('No file path provided for cleanup');
-        return;
-    }
-    
-    if (fs.existsSync(filePath)) {
-        fs.unlink(filePath, (err) => {
-            if (err) {
-                console.error(`Error deleting temp file ${filePath}:`, err);
-            } else {
-                console.log(`Temporary file ${filePath} deleted successfully (${reason}).`);
-            }
-        });
-    } else {
-        console.warn(`Attempted to delete temp file ${filePath}, but it did not exist (${reason}).`);
-    }
-}
-
-// Add cleanup function
-function cleanupRecording() {
-    console.log('Forcing recording cleanup...');
-    
-    // Force stop audio recorder
-    if (audioRecorder) {
-        try {
-            audioRecorder.stopRecording().catch(error => {
-                // Ignore "No active recording" errors as this is expected in some cases
-                if (error.message !== 'No active recording to stop') {
-                    console.error('Error force stopping audio recorder:', error);
-                }
-            });
-        } catch (error) {
-            // Ignore "No active recording" errors
-            if (error.message !== 'No active recording to stop') {
-                console.error('Error force stopping audio recorder:', error);
-            }
-        }
-    }
-
-    // Reset state
-    setState({ 
-        isRecording: false, 
-        statusMessage: 'Idle',
-        transcriptionStatus: null
-    });
-
-    // Update UI
-    if (recordingWindow && !recordingWindow.isDestroyed()) {
-        recordingWindow.webContents.send('recording-state-change', false);
-    }
-
-    // Cleanup temp file
-    if (tempRecordingPath) {
-        cleanupTempFile(tempRecordingPath, 'Force cleanup');
-    }
-}
-
-async function stopRecording() {
-    // Prevent multiple stop attempts
-    if (isStoppingRecording) {
-        console.log('Stop recording already in progress...');
-        return;
-    }
-
-    try {
-        isStoppingRecording = true;
-        setState({ statusMessage: 'Stopping recording...' });
-        
-        // Clear any existing timeout
-        if (stopRecordingTimeout) {
-            clearTimeout(stopRecordingTimeout);
-        }
-
-        // Set a timeout to force stop if it takes too long
-        stopRecordingTimeout = setTimeout(() => {
-            console.warn('Force stopping recording due to timeout...');
-            cleanupRecording();
-        }, 30000); // 30 second timeout
-
-        // Ensure we have an active meeting
-        if (!state.currentMeeting) {
-            throw new Error('No active meeting session');
-        }
-
-        // Stop the recording
-        if (!audioRecorder) {
-            throw new Error('Audio recorder not initialized');
-        }
-
-        console.log('Stopping audio recording...');
-        await audioRecorder.stopRecording();
-        setState({ isRecording: false });
-
-        // Ensure we have a valid recording path
-        if (!tempRecordingPath) {
-            throw new Error('Recording path not set');
-        }
-
-        console.log('Waiting for file to be written...');
-        // Wait for the file to be fully written
-        await new Promise((resolve, reject) => {
-            let attempts = 0;
-            const maxAttempts = 50; // 5 seconds total (50 * 100ms)
-            
-            const checkFile = async () => {
-                try {
-                    console.log('Checking file status...');
-                    const stats = await fs.promises.stat(tempRecordingPath);
-                    console.log(`File size: ${stats.size} bytes`);
-                    
-                    if (stats.size > 0) {
-                        console.log('File write complete, proceeding with transcription...');
-                        // Wait an additional second to ensure FFmpeg has finished writing
-                        await new Promise(resolve => setTimeout(resolve, 1000));
-                        resolve();
-                        return;
-                    }
-                    
-                    attempts++;
-                    if (attempts >= maxAttempts) {
-                        reject(new Error('Timeout waiting for file to be written after max attempts'));
-                        return;
-                    }
-                    
-                    setTimeout(checkFile, 100);
-                } catch (error) {
-                    console.error('Error checking file:', error);
-                    if (error.code === 'ENOENT') {
-                        attempts++;
-                        if (attempts >= maxAttempts) {
-                            reject(new Error('File not found after max attempts'));
-                            return;
-                        }
-                        setTimeout(checkFile, 100);
-                    } else {
-                        reject(error);
-                    }
-                }
-            };
-
-            checkFile();
-        });
-
-        // Check authentication before proceeding with transcription
-        console.log('Checking authentication...');
-        const authCheckPromise = supabase.auth.getSession();
-        const authTimeout = new Promise((_, reject) => {
-            setTimeout(() => reject(new Error('Authentication check timed out after 5 seconds')), 5000);
-        });
-
-        try {
-            const { data: { session }, error: sessionError } = await Promise.race([
-                authCheckPromise,
-                authTimeout
-            ]);
-
-            if (sessionError) {
-                throw sessionError;
-            }
-
-            if (!session) {
-                throw new Error('No valid authentication session');
-            }
-
-            // Try to refresh the session if we have one
-            console.log('Refreshing authentication session...');
-            const { data: { session: refreshedSession }, error: refreshError } = await supabase.auth.refreshSession();
-            
-            if (refreshError) {
-                throw refreshError;
-            }
-
-            if (!refreshedSession) {
-                throw new Error('Session refresh failed');
-            }
-
-            // Read the recording file
-            console.log('Reading audio file...');
-            const audioBlob = await fs.promises.readFile(tempRecordingPath);
-            console.log('Read audio file, size:', audioBlob.length);
-            
-            // Clear the timeout since we've successfully read the file
-            if (stopRecordingTimeout) {
-                clearTimeout(stopRecordingTimeout);
-                stopRecordingTimeout = null;
-            }
-            
-            setState({ statusMessage: 'Transcribing...' });
-
-            try {
-                // Set up subscription BEFORE sending audio
-                console.log('Setting up transcription subscription...');
-                const subscription = mishiIntegration.subscribeToTranscriptionStatus(
-                    state.currentMeeting.id,
-                    async (status, updatedMeeting) => {
-                        console.log('[Main] Transcription status update:', {
-                            status,
-                            hasMeetingData: !!updatedMeeting,
-                            meetingId: updatedMeeting?.id
-                        });
-                        
-                        setState({
-                            transcriptionStatus: status,
-                            statusMessage: status === 'completed' 
-                                ? 'Transcription completed' 
-                                : status === 'error' 
-                                ? 'Transcription failed' 
-                                : `Processing transcription (${status})`
-                        });
-
-                        if (updatedMeeting) {
-                            state.currentMeeting = updatedMeeting;
-                            
-                            // Notify windows of update
-                            BrowserWindow.getAllWindows().forEach(window => {
-                                if (!window.isDestroyed()) {
-                                    window.webContents.send('meeting-updated', {
-                                        type: 'meeting-updated',
-                                        meeting: updatedMeeting
-                                    });
-                                }
-                            });
-                            
-                            // Open in web app if completed
-                            if (status === 'completed') {
-                                try {
-                                    const url = await mishiIntegration.openInWebApp(state.user.id);
-                                    shell.openExternal(url);
-                                } catch (error) {
-                                    console.error('[Main] Error opening meeting in web app:', error);
-                                }
-                            }
-                        }
-
-                        // Unsubscribe after completion or error
-                        if (status === 'completed' || status === 'error') {
-                            subscription();
-                        }
-                    }
-                );
-
-                // Send for transcription
-                console.log('Sending audio for transcription...');
-                await mishiIntegration.transcribeAudio(audioBlob, state.currentMeeting.id);
-                console.log('Audio sent for transcription successfully');
-
-                // Only clean up the temp file after transcription is initiated
-                cleanupTempFile(tempRecordingPath, 'Recording sent for transcription');
-
-            } catch (transcriptionError) {
-                console.error('Transcription error:', transcriptionError);
-                setState({ 
-                    statusMessage: `Error: ${transcriptionError.message}`,
-                    transcriptionStatus: 'error'
-                });
-                
-                // Only show dialog for non-auth errors (auth errors are handled elsewhere)
-                if (!transcriptionError.message.includes('authentication')) {
-                    dialog.showErrorBox('Transcription Error', transcriptionError.message);
-                }
-
-                // Clean up on transcription error
-                cleanupTempFile(tempRecordingPath, 'Transcription error cleanup');
-            }
-
-        } catch (error) {
-            console.error('Transcription error:', error);
-            setState({ 
-                statusMessage: `Error: ${error.message}`,
-                transcriptionStatus: 'error'
-            });
-            
-            // Only show dialog for non-auth errors
-            if (!error.message.includes('authentication')) {
-                dialog.showErrorBox('Recording Error', `Failed to stop recording: ${error.message}`);
-            }
-            
-            cleanupRecording();
-        }
-
-    } catch (error) {
-        console.error('Failed to stop recording:', error);
-        setState({ 
-            statusMessage: `Error: ${error.message}`,
-            transcriptionStatus: 'error'
-        });
-        
-        // Only show dialog for non-auth errors
-        if (!error.message.includes('authentication')) {
-            dialog.showErrorBox('Recording Error', `Failed to stop recording: ${error.message}`);
-        }
-        
-        cleanupRecording();
-    } finally {
-        if (stopRecordingTimeout) {
-            clearTimeout(stopRecordingTimeout);
-            stopRecordingTimeout = null;
-        }
-        isStoppingRecording = false;
-    }
-}
-
-function quitApp() {
-    console.log("Quit action triggered...");
-    if (audioRecorder.isCurrentlyRecording()) {
-        console.log("Attempting to stop recording process before quit...");
-        audioRecorder.stopRecording()
-            .catch(error => console.error("Error stopping recording during quit:", error))
-            .finally(() => {
-                if (mishiIntegration) {
-                    console.log("Cleaning up Mishi integration...");
-                    mishiIntegration.cleanup();
-                }
-                app.quit();
-            });
-    } else {
-        if (mishiIntegration) {
-            console.log("Cleaning up Mishi integration...");
-            mishiIntegration.cleanup();
-        }
-        app.quit();
-    }
-}
 
 // --- Electron App Lifecycle ---
 
@@ -1113,13 +455,20 @@ app.on('ready', async () => {
     }
     try {
         // Initialize Mishi Integration first
-        mishiIntegration = new MishiIntegration({
+        mishiIntegration = mishiServiceModule.initMishiService({
             supabaseUrl: SUPABASE_URL,
             supabaseKey: SUPABASE_SERVICE_ROLE_KEY,
             anonKey: SUPABASE_ANON_KEY,
             webAppUrl: MISHI_WEB_APP_URL
         });
         console.log("Mishi integration initialized successfully");
+
+        // Initialize authService (Supabase client for auth.js)
+        authService.initAuth({
+            storeInstance: store,
+            mishiServiceInstance: mishiIntegration,
+            setStateFn: setState,
+        });
 
         // Initialize Supabase Client
         supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
@@ -1143,14 +492,72 @@ app.on('ready', async () => {
         });
         console.log("Supabase client initialized successfully");
 
+        // Initialize the recording service before creating the tray
+        console.log('[main.js] Calling recordingServiceModule.initRecordingService');
+        recordingServiceModule.initRecordingService({
+            store,
+            mishiService: mishiIntegration,
+            supabase,
+            getState,
+            setState,
+            TEMP_RECORDING_FILENAME
+        });
+
         // Create tray *after* initial setup and checks
-        // await createTray(); // Keep this commented/removed as it was moved below
-        
-        // Initialize AudioRecorder
-        initializeAudioRecorder();
+        console.log('[main.js] Calling trayManager.initializeTray');
+        await trayManager.initializeTray(getState(), store, {
+            startRecording: recordingServiceModule.startRecording,
+            stopRecording: recordingServiceModule.stopRecording,
+            updateAudioDevice: recordingServiceModule.updateAudioDevice,
+            showLoginWindow: () => windowManager.showLoginWindow({
+                preloadPath: path.join(__dirname, 'preload.js'),
+                loginHtmlPath: path.join(__dirname, 'login.html')
+            }),
+            toggleSettingsPanel: () => windowManager.toggleSettingsPanel({
+                recordingWindow: null, // Should be managed by windowManager
+                preloadPath: path.join(__dirname, 'preload.js'),
+                settingsHtmlPath: path.join(__dirname, 'settingsPanel.html'),
+                screen,
+                onHide: () => {}
+            }),
+            logout: authService.logout,
+            ensureRecordingWindow: () => {
+                global.recordingWindow = windowManager.ensureRecordingWindow({
+                    preloadPath: path.join(__dirname, 'preload.js'),
+                    recordingHtmlPath: path.join(__dirname, 'recordingWindow.html'),
+                    state: getState(),
+                    onClose: () => { global.recordingWindow = null; }
+                });
+                console.log('[main.js] ensureRecordingWindow: global.recordingWindow =', global.recordingWindow);
+                if (global.recordingWindow && !global.recordingWindow.isDestroyed()) {
+                    global.recordingWindow.webContents.send('recording-state-change', getState().isRecording);
+                }
+            }
+        });
 
         // Initialize IPC Listeners
-        setupIPCListeners();
+        setupIPCHandlers({
+            state: getState(),
+            getState,
+            store,
+            audioRecorder,
+            tempRecordingPath,
+            setState,
+            startRecording: recordingServiceModule.startRecording,
+            stopRecording: recordingServiceModule.stopRecording,
+            cleanupRecording: recordingServiceModule.cleanupRecording,
+            recordingWindow,
+            settingsWindow,
+            createAndShowLoginWindow,
+            createSettingsWindow,
+            hideSettingsWindow,
+            createRecordingWindow: recordingServiceModule.createRecordingWindow,
+            updateAudioDevice: recordingServiceModule.updateAudioDevice,
+            isStoppingRecording,
+            mishiIntegration,
+            supabase,
+            authService,
+        });
 
         // Set up auth state change listener
         supabase.auth.onAuthStateChange(async (event, session) => {
@@ -1173,6 +580,11 @@ app.on('ready', async () => {
                 setState({ statusMessage: 'Error: Session check failed' });
             } else if (session) {
                 console.log("Found existing session");
+                setState({
+                    isLoggedIn: true,
+                    user: session.user,
+                    statusMessage: 'Idle'
+                });
             } else {
                 console.log("No active session found");
                 setState({ 
@@ -1187,7 +599,23 @@ app.on('ready', async () => {
 
         // Create tray *after* other initial setup
         console.log('[Ready Handler End] Attempting tray creation...');
-        await createTray(); 
+        await trayManager.initializeTray(getState(), store, {
+            startRecording: recordingServiceModule.startRecording,
+            stopRecording: recordingServiceModule.stopRecording,
+            updateAudioDevice: recordingServiceModule.updateAudioDevice,
+            showLoginWindow: () => windowManager.showLoginWindow({
+                preloadPath: path.join(__dirname, 'preload.js'),
+                loginHtmlPath: path.join(__dirname, 'login.html')
+            }),
+            toggleSettingsPanel: () => windowManager.toggleSettingsPanel({
+                recordingWindow: null, // Should be managed by windowManager
+                preloadPath: path.join(__dirname, 'preload.js'),
+                settingsHtmlPath: path.join(__dirname, 'settingsPanel.html'),
+                screen,
+                onHide: () => {}
+            }),
+            logout: authService.logout
+        }); 
 
     } catch (error) {
         console.error("Critical initialization error:", error);
@@ -1202,6 +630,7 @@ app.on('ready', async () => {
 
 // --- IPC Handling (Example if using Login Window) ---
 
+/* Removing unused duplicate IPC handler function
 function setupIPCListeners() {
     if (isIPCSetup) {
         console.log('IPC handlers already set up, skipping...');
@@ -1304,152 +733,39 @@ function setupIPCListeners() {
                                 // Close the auth window
                                 authWindow.close();
                                 resolve({ success: true });
-                            } catch (err) {
-                                console.error('Error processing OAuth response:', err);
+                            } catch (error) {
                                 authWindow.close();
-                                reject(err);
+                                reject(error);
                             }
                         }
                     };
 
+                    // Set up navigation listener
                     authWindow.webContents.on('will-navigate', handleNavigation);
                     authWindow.webContents.on('will-redirect', handleNavigation);
 
-                    // Handle window closing
+                    // Handle window close before auth completes
                     authWindow.on('closed', () => {
-                        resolve({ success: false, error: 'Authentication window was closed' });
+                        resolve({ success: false, error: 'Authentication window was closed before completion' });
                     });
                 });
 
             } catch (error) {
-                console.error('OAuth initiation error:', error);
+                console.error("OAuth error:", error);
                 return { 
                     success: false, 
-                    error: error.message || "Failed to initialize Google login" 
+                    error: error.message || "Failed to authenticate with Google" 
                 };
             }
         });
 
-        // Other IPC handlers...
-        ipcMain.on('close-login-window', () => {
-            if (loginWindow && !loginWindow.isDestroyed()) {
-                loginWindow.close();
-            }
-        });
-
-        ipcMain.on('stop-recording', async () => {
-            try {
-                // Check if we're already in the process of stopping
-                if (isStoppingRecording) {
-                    console.log('Stop recording already in progress, ignoring duplicate request');
-                    return;
-                }
-
-                // Check if we're actually recording
-                if (!state.isRecording) {
-                    console.log('No active recording to stop');
-                    // Still update UI just in case it's out of sync
-                    recordingWindow?.webContents.send('recording-state-change', false);
-                    return;
-                }
-
-                await stopRecording();
-            } catch (error) {
-                console.error('Failed to stop recording:', error);
-                dialog.showErrorBox('Recording Error', `Failed to stop recording: ${error.message}`);
-                // Force cleanup on error
-                cleanupRecording();
-            }
-        });
-
-        // Mark IPC as set up
         isIPCSetup = true;
-        console.log('IPC handlers set up successfully');
-
     } catch (error) {
-        console.error('Error setting up IPC handlers:', error);
-        dialog.showErrorBox(
-            'Initialization Error',
-            `Failed to set up application handlers: ${error.message}`
-        );
+        console.error("Error setting up IPC handlers:", error);
     }
 }
+*/
 
-// Extracted logic for creating the window
-let loginWindow = null;
-function createAndShowLoginWindow() {
-    try {
-        if (loginWindow && !loginWindow.isDestroyed()) {
-            loginWindow.focus();
-            return;
-        }
-
-        loginWindow = new BrowserWindow({
-            width: 400,
-            height: 600,
-            webPreferences: {
-                preload: path.join(__dirname, 'preload.js'),
-                contextIsolation: true,
-                nodeIntegration: false,
-            },
-            show: false,
-            resizable: false,
-            maximizable: false,
-            fullscreenable: false,
-            title: "Login - Mishi Recorder",
-        });
-
-        loginWindow.loadFile(path.join(__dirname, 'login.html'))
-            .catch(error => {
-                console.error('Failed to load login window:', error);
-                dialog.showErrorBox('Login Error', 'Failed to open login window. Please try again.');
-                if (loginWindow && !loginWindow.isDestroyed()) {
-                    loginWindow.close();
-                }
-                loginWindow = null;
-            });
-
-        loginWindow.once('ready-to-show', () => {
-            loginWindow.show();
-        });
-
-        // Handle window close
-        loginWindow.on('close', () => {
-            // Clean up any remaining IPC handlers
-            ipcMain.removeHandler('login');
-            loginWindow = null;
-        });
-
-    } catch (error) {
-        console.error('Error creating login window:', error);
-        dialog.showErrorBox('Login Error', 'Failed to create login window. Please try again.');
-        loginWindow = null;
-    }
-}
-
-// --- Utility Functions ---
-// (Add any helper functions here)
-
-
-// --- Error Handling ---
-process.on('uncaughtException', (error) => {
-    console.error('Uncaught Exception:', error);
-    // Log this error appropriately
-    // Optionally: inform the user via dialog, update Tray status
-    setState({ statusMessage: `Error: Critical error occurred` });
-    // Consider whether to quit the app on critical errors
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-    // Log this error
-    setState({ statusMessage: `Error: Unhandled promise rejection` });
-});
-
-
-console.log("Main process script loaded.");
-
-// --- Audio Device Management ---
 async function updateAudioDevice(newSettings) {
     let oldRecorder = null;
     let newRecorder = null;
@@ -1554,7 +870,23 @@ async function updateAudioDevice(newSettings) {
                 if (!tray || tray.isDestroyed()) {
                     throw new Error('Tray is not available');
                 }
-                await updateTrayMenu();
+                await trayManager.initializeTray(getState(), store, {
+                    startRecording: recordingServiceModule.startRecording,
+                    stopRecording: recordingServiceModule.stopRecording,
+                    updateAudioDevice: recordingServiceModule.updateAudioDevice,
+                    showLoginWindow: () => windowManager.showLoginWindow({
+                        preloadPath: path.join(__dirname, 'preload.js'),
+                        loginHtmlPath: path.join(__dirname, 'login.html')
+                    }),
+                    toggleSettingsPanel: () => windowManager.toggleSettingsPanel({
+                        recordingWindow: null, // Should be managed by windowManager
+                        preloadPath: path.join(__dirname, 'preload.js'),
+                        settingsHtmlPath: path.join(__dirname, 'settingsPanel.html'),
+                        screen,
+                        onHide: () => {}
+                    }),
+                    logout: authService.logout
+                });
                 console.log('Menu updated successfully');
             } catch (err) {
                 console.error(`Error updating menu (attempt ${retryCount + 1}):`, err);
@@ -1635,7 +967,7 @@ function startAudioVisualization() {
     if (audioVisualizationInterval) return;
     
     audioVisualizationInterval = setInterval(() => {
-        if (recordingWindow && state.isRecording) {
+        if (recordingWindow && getState().isRecording) {
             const audioData = audioRecorder.getAudioData();
             recordingWindow.webContents.send('audio-data', audioData);
         }
@@ -1671,169 +1003,25 @@ function setupThemeChangeListener() {
 
 // Add IPC handler for closing the recording window
 ipcMain.on('close-recording-window', () => {
-    if (recordingWindow && !state.isRecording) {
+    if (recordingWindow && !getState().isRecording) {
         recordingWindow.hide();
     }
-});
-
-// Function to hide settings window with animation
-function hideSettingsWindow() {
-    if (!settingsWindow) return;
-    
-    // Update caret button state in recording window
-    recordingWindow?.webContents.send('settings-state-change', false);
-    
-    // Trigger hide animation
-    settingsWindow.webContents.send('before-hide');
-    
-    // Wait for animation to complete
-    setTimeout(() => {
-        if (settingsWindow) {
-            settingsWindow.hide();
-        }
-    }, 150); // Match the animation duration
-}
-
-// Add function to create settings window
-function createSettingsWindow() {
-    // Don't create if recording window doesn't exist
-    if (!recordingWindow) return;
-    
-    if (settingsWindow) {
-        settingsWindow.show();
-        return;
-    }
-
-    settingsWindow = new BrowserWindow({
-        width: 300,
-        height: 400,
-        frame: false,
-        transparent: true,
-        resizable: false,
-        skipTaskbar: true,
-        alwaysOnTop: true,
-        hasShadow: true,
-        webPreferences: {
-            preload: path.join(__dirname, 'preload.js'),
-            contextIsolation: true,
-            nodeIntegration: false,
-        },
-        show: false,
-        type: 'panel',
-        vibrancy: 'menu',
-        parent: recordingWindow, // Make recording window the parent
-    });
-
-    settingsWindow.loadFile('settingsPanel.html');
-
-    // Position window above recording window
-    function positionWindow() {
-        if (!recordingWindow || recordingWindow.isDestroyed()) {
-            settingsWindow?.close();
-            return;
-        }
-
-        const recordingBounds = recordingWindow.getBounds();
-        const settingsBounds = settingsWindow.getBounds();
-        
-        // Center horizontally relative to recording window
-        const x = Math.round(recordingBounds.x + (recordingBounds.width / 2) - (settingsBounds.width / 2));
-        
-        // Position above recording window with 8px gap (matching the arrow)
-        const y = Math.round(recordingBounds.y - settingsBounds.height - 8);
-
-        // Get the display where the recording window is located
-        const display = screen.getDisplayNearestPoint({
-            x: recordingBounds.x,
-            y: recordingBounds.y
-        });
-        const workArea = display.workArea;
-
-        // Ensure window stays within screen bounds
-        const adjustedX = Math.max(workArea.x, Math.min(x, workArea.x + workArea.width - settingsBounds.width));
-        const adjustedY = Math.max(workArea.y, Math.min(y, workArea.y + workArea.height - settingsBounds.height));
-
-        settingsWindow.setPosition(adjustedX, adjustedY);
-    }
-
-    settingsWindow.once('ready-to-show', () => {
-        positionWindow();
-        settingsWindow.show();
-        settingsWindow.focus();
-    });
-
-    // Hide settings when recording window moves
-    recordingWindow.on('move', () => {
-        positionWindow();
-    });
-
-    // Hide settings when recording window is hidden
-    recordingWindow.on('hide', () => {
-        settingsWindow?.hide();
-    });
-
-    settingsWindow.on('blur', () => {
-        if (!recordingWindow?.isFocused()) {
-            hideSettingsWindow();
-        }
-    });
-
-    settingsWindow.on('hide', () => {
-        if (settingsWindow) {
-            settingsWindow.destroy();
-        }
-        settingsWindow = null;
-    });
-}
-
-// Add IPC handlers for settings
-ipcMain.handle('get-settings', () => {
-    return store.store;
-});
-
-ipcMain.handle('update-settings', (_, changes) => {
-    // Deep merge changes with existing settings
-    const mergeChanges = (target, source) => {
-        Object.keys(source).forEach(key => {
-            if (source[key] && typeof source[key] === 'object') {
-                if (!target[key]) Object.assign(target, { [key]: {} });
-                mergeChanges(target[key], source[key]);
-            } else {
-                Object.assign(target, { [key]: source[key] });
-            }
-        });
-    };
-
-    const currentSettings = store.store;
-    mergeChanges(currentSettings, changes);
-    store.store = currentSettings;
-
-    // Notify all windows about the settings change
-    if (recordingWindow) {
-        recordingWindow.webContents.send('settings-change', store.store);
-    }
-    if (settingsWindow) {
-        settingsWindow.webContents.send('settings-change', store.store);
-    }
-
-    return store.store;
 });
 
 // Add IPC handler for toggling settings window
 ipcMain.on('toggle-settings', () => {
     if (settingsWindow) {
-        hideSettingsWindow();
+        hideSettingsWindow({ settingsWindow, recordingWindow });
     } else {
-        createSettingsWindow();
+        createSettingsWindow({
+            recordingWindow,
+            preloadPath: path.join(__dirname, 'preload.js'),
+            settingsHtmlPath: path.join(__dirname, 'settingsPanel.html'),
+            screen,
+            onHide: () => { settingsWindow = null; }
+        });
         // Update caret button state in recording window
         recordingWindow?.webContents.send('settings-state-change', true);
-    }
-});
-
-// Remove or update the existing open-settings handler
-ipcMain.on('open-settings', () => {
-    if (!settingsWindow) {
-        createSettingsWindow();
     }
 });
 
@@ -1842,44 +1030,12 @@ ipcMain.on('toggle-recording-window', () => {
     if (recordingWindow && recordingWindow.isVisible()) {
         recordingWindow.hide();
     } else {
-        createRecordingWindow();
-    }
-});
-
-// Add IPC handlers for recording
-ipcMain.on('start-recording', async () => {
-    try {
-        await audioRecorder.startRecording(tempRecordingPath);
-        setState({ isRecording: true, statusMessage: 'Recording...' });
-        recordingWindow?.webContents.send('recording-state-change', true);
-    } catch (error) {
-        console.error('Failed to start recording:', error);
-        dialog.showErrorBox('Recording Error', `Failed to start recording: ${error.message}`);
-    }
-});
-
-ipcMain.on('stop-recording', async () => {
-    try {
-        // Check if we're already in the process of stopping
-        if (isStoppingRecording) {
-            console.log('Stop recording already in progress, ignoring duplicate request');
-            return;
-        }
-
-        // Check if we're actually recording
-        if (!state.isRecording) {
-            console.log('No active recording to stop');
-            // Still update UI just in case it's out of sync
-            recordingWindow?.webContents.send('recording-state-change', false);
-            return;
-        }
-
-        await stopRecording();
-    } catch (error) {
-        console.error('Failed to stop recording:', error);
-        dialog.showErrorBox('Recording Error', `Failed to stop recording: ${error.message}`);
-        // Force cleanup on error
-        cleanupRecording();
+        recordingServiceModule.createRecordingWindow({
+            preloadPath: path.join(__dirname, 'preload.js'),
+            recordingHtmlPath: path.join(__dirname, 'recordingWindow.html'),
+            state: getState(),
+            onClose: () => { recordingWindow = null; }
+        });
     }
 });
 
@@ -1889,13 +1045,119 @@ ipcMain.on('open-login-window', () => {
         loginWindow.focus();
         return;
     }
-    createAndShowLoginWindow();
+    createAndShowLoginWindow({
+        preloadPath: path.join(__dirname, 'preload.js'),
+        loginHtmlPath: path.join(__dirname, 'login.html')
+    });
 });
 
-// Add timeout helper at the top level
-function withTimeout(promise, timeoutMs, operation) {
-    const timeout = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error(`${operation} timed out after ${timeoutMs}ms`)), timeoutMs);
-    });
-    return Promise.race([promise, timeout]);
-} 
+app.on('window-all-closed', (event) => {
+    // Prevent quitting the app when all windows are closed (for tray-only behavior)
+    event.preventDefault();
+    // Do not call app.quit() here; keep the app running in the tray
+});
+
+authEvents.on('initialSessionChecked', () => {
+    hasCheckedInitialSession = true;
+});
+
+// Remove previous dockbar-hover and dockbar-leave handlers
+// Add dockbar-click handler
+ipcMain.on('dockbar-click', () => {
+    // Open/focus the floating bar (recording window) first
+    function openMeetingOverlayAfterBar() {
+        if (global.meetingOverlayWindow && !global.meetingOverlayWindow.isDestroyed()) {
+            global.meetingOverlayWindow.focus();
+            return;
+        }
+        if (windowManager && windowManager.createMeetingOverlayWindow) {
+            global.meetingOverlayWindow = windowManager.createMeetingOverlayWindow({ company: '', template: '', content: '' });
+            if (global.meetingOverlayWindow) {
+                global.meetingOverlayWindow.on('closed', () => {
+                    global.meetingOverlayWindow = null;
+                });
+            }
+        }
+    }
+
+    if (windowManager && windowManager.ensureRecordingWindow) {
+        global.recordingWindow = windowManager.ensureRecordingWindow({
+            preloadPath: path.join(__dirname, 'preload.js'),
+            recordingHtmlPath: path.join(__dirname, 'recordingWindow.html'),
+            state: getState(),
+            onClose: () => { global.recordingWindow = null; }
+        });
+        if (global.recordingWindow && !global.recordingWindow.isDestroyed()) {
+            global.recordingWindow.show();
+            global.recordingWindow.focus();
+            global.recordingWindow.webContents.send('recording-state-change', getState().isRecording);
+            // Wait for the bar to be ready before opening overlay
+            if (global.recordingWindow.isVisible()) {
+                openMeetingOverlayAfterBar();
+            } else {
+                global.recordingWindow.once('show', openMeetingOverlayAfterBar);
+            }
+        }
+    } else {
+        // Fallback: just open overlay
+        openMeetingOverlayAfterBar();
+    }
+});
+
+// --- IPC: Fetch companies and meeting templates for meeting dialog ---
+/* Commenting out duplicate IPC handlers that are now properly implemented in ipcHandlers.js
+ipcMain.handle('get-companies', async (event) => {
+    try {
+        const state = getState();
+        if (!state.user || !state.user.id || !state.workspace || !state.workspace.id) {
+            return { success: false, error: 'No user or workspace found' };
+        }
+        const { data, error } = await supabase
+            .from('companies')
+            .select('id, name')
+            .eq('workspace_id', state.workspace.id)
+            .order('name', { ascending: true });
+        if (error) return { success: false, error: error.message };
+        return { success: true, companies: data };
+    } catch (err) {
+        return { success: false, error: err.message };
+    }
+});
+
+ipcMain.handle('get-meeting-templates', async (event) => {
+    try {
+        const state = getState();
+        console.log('[get-meeting-templates] state.user:', state.user);
+        console.log('[get-meeting-templates] state.workspace:', state.workspace);
+        if (!state.user || !state.user.id || !state.workspace || !state.workspace.id) {
+            return { success: false, error: 'No user or workspace found' };
+        }
+        const { data, error } = await supabase
+            .from('meeting_templates')
+            .select('id, name, content')
+            .eq('workspace_id', state.workspace.id)
+            .order('name', { ascending: true });
+        console.log('[get-meeting-templates] data:', data, 'error:', error);
+        if (error) return { success: false, error: error.message };
+        return { success: true, templates: data };
+    } catch (err) {
+        return { success: false, error: err.message };
+    }
+});
+*/
+
+// Add new IPC handler for 'open-meeting-overlay'
+ipcMain.on('open-meeting-overlay', (event, { company, template, content }) => {
+    const state = getState();
+    if (!state.user || !state.workspace) {
+        // Send an error back to the renderer if not logged in or no workspace
+        event.sender.send('open-meeting-overlay-error', {
+            error: 'You must be logged in and have a workspace to start a meeting.'
+        });
+        return;
+    }
+    console.log('[IPC] open-meeting-overlay called with:', { company, template, content });
+    if (windowManager && windowManager.createMeetingOverlayWindow) {
+        windowManager.createMeetingOverlayWindow({ company, template, content });
+    }
+});

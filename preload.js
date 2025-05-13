@@ -4,26 +4,16 @@ console.log('Preload script loaded.');
 
 // Expose protected methods that allow the renderer process to use
 // the ipcRenderer without exposing the entire object
-contextBridge.exposeInMainWorld(
-    'electron',
-    {
-        ipcRenderer: {
-            invoke: (channel, data) => {
-                const validChannels = ['login', 'oauth-login'];
-                if (validChannels.includes(channel)) {
-                    return ipcRenderer.invoke(channel, data);
-                }
-                throw new Error(`Invalid channel: ${channel}`);
-            },
-            send: (channel, data) => {
-                const validChannels = ['login-success'];
-                if (validChannels.includes(channel)) {
-                    ipcRenderer.send(channel, data);
-                }
-            }
-        }
+contextBridge.exposeInMainWorld('electron', {
+    ipcRenderer: {
+        send: (...args) => ipcRenderer.send(...args),
+        invoke: (...args) => ipcRenderer.invoke(...args),
+        on: (...args) => ipcRenderer.on(...args),
+        once: (...args) => ipcRenderer.once(...args),
+        removeListener: (...args) => ipcRenderer.removeListener(...args),
+        // Add more methods as needed
     }
-);
+});
 
 console.log('IPC channels exposed to window object.');
 
@@ -50,6 +40,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // Settings APIs
     getSettings: () => ipcRenderer.invoke('get-settings'),
     updateSettings: (changes) => ipcRenderer.invoke('update-settings', changes),
+    listAudioInputDevices: () => ipcRenderer.invoke('list-audio-input-devices'),
     onSettingsChange: (callback) => ipcRenderer.on('settings-change', (_, settings) => callback(settings)),
     onSettingsStateChange: (callback) => ipcRenderer.on('settings-state-change', (_, isOpen) => callback(isOpen)),
     onBeforeHide: (callback) => ipcRenderer.on('before-hide', callback)
