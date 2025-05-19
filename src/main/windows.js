@@ -15,6 +15,8 @@ function showLoginWindow({ preloadPath, loginHtmlPath }) {
         width: 400,
         height: 600,
         resizable: false,
+        frame: false,
+        ...(process.platform === 'darwin' ? { titleBarStyle: 'hidden' } : {}),
         webPreferences: {
             preload: preloadPath,
             nodeIntegration: false,
@@ -26,60 +28,6 @@ function showLoginWindow({ preloadPath, loginHtmlPath }) {
     loginWindow.loadFile(loginHtmlPath);
     loginWindow.on('closed', () => { loginWindow = null; });
     return loginWindow;
-}
-
-function ensureRecordingWindow({ preloadPath, recordingHtmlPath, state, onClose }) {
-    console.log('[windows.js] ensureRecordingWindow called with:', { preloadPath, recordingHtmlPath, state, onClose });
-    const barHtmlPath = path.join(__dirname, '../../recordingBar.html');
-    const { width: screenWidth, height: screenHeight } = screen.getPrimaryDisplay().workAreaSize;
-    // Dock bar height and margin
-    const dockBarHeight = 8;
-    const margin = 8;
-    const barWidth = 800; // TEMP: for debugging, adjust as needed
-    const barHeight = 56; // Typical floating bar height
-    const x = Math.round(screenWidth / 2 - barWidth / 2);
-    const y = screenHeight - dockBarHeight - margin - barHeight;
-    if (recordingWindow && !recordingWindow.isDestroyed()) {
-        recordingWindow.setBounds({ x, y, width: barWidth, height: barHeight });
-        recordingWindow.show();
-        recordingWindow.focus();
-        return recordingWindow;
-    }
-    recordingWindow = new BrowserWindow({
-        width: barWidth,
-        height: barHeight,
-        x,
-        y,
-        resizable: false,
-        movable: true,
-        minimizable: false,
-        maximizable: false,
-        closable: true,
-        alwaysOnTop: true,
-        skipTaskbar: true,
-        frame: false,
-        transparent: true,
-        roundedCorners: true,
-        hasShadow: true,
-        webPreferences: {
-            preload: preloadPath,
-            nodeIntegration: false,
-            contextIsolation: true,
-        },
-        autoHideMenuBar: true,
-        title: 'Recording Bar',
-    });
-    recordingWindow.loadFile(barHtmlPath).then(() => {
-        console.log('[windows.js] Loaded recordingBar.html:', barHtmlPath);
-    }).catch((err) => {
-        console.error('[windows.js] Failed to load recordingBar.html:', barHtmlPath, err);
-    });
-    if (onClose) {
-        recordingWindow.on('closed', onClose);
-    } else {
-        recordingWindow.on('closed', () => { recordingWindow = null; });
-    }
-    return recordingWindow;
 }
 
 function toggleSettingsPanel({ recordingWindow, preloadPath, settingsHtmlPath, screen, onHide }) {
@@ -236,8 +184,8 @@ function createDockBarWindow({ preloadPath }) {
 function createMeetingOverlayWindow({ company, template, content }) {
     console.log('[windows.js] createMeetingOverlayWindow called with:', { company, template, content });
     // Anchor overlay above floating bar
-    let overlayWidth = 520;
-    let overlayHeight = 480;
+    let overlayWidth = 960;
+    let overlayHeight = 600;
     let x, y;
     // Prefer global.recordingWindow if available
     let barWindow = global.recordingWindow && !global.recordingWindow.isDestroyed() ? global.recordingWindow : (typeof recordingWindow !== 'undefined' && recordingWindow && !recordingWindow.isDestroyed() ? recordingWindow : null);
@@ -251,7 +199,7 @@ function createMeetingOverlayWindow({ company, template, content }) {
         x = Math.round(screenWidth / 2 - overlayWidth / 2);
         y = Math.round(screenHeight / 2 - overlayHeight / 2);
     }
-    const overlayWindow = new BrowserWindow({
+    const overlayWindowOptions = {
         width: overlayWidth,
         height: overlayHeight,
         x,
@@ -263,19 +211,24 @@ function createMeetingOverlayWindow({ company, template, content }) {
         closable: true,
         alwaysOnTop: true,
         skipTaskbar: true,
-        frame: true, // TEMP: set to true for debugging
+        frame: false, // Frameless for custom chrome
         transparent: false,
         hasShadow: true,
         show: true,
         center: false,
+        // Try customButtonsOnHover for macOS
+        ...(process.platform === 'darwin' ? { titleBarStyle: 'customButtonsOnHover' } : {}),
         webPreferences: {
             preload: path.join(__dirname, '../../preload.js'),
             contextIsolation: true,
             nodeIntegration: false,
+            enableRemoteModule: false,
         },
         autoHideMenuBar: true,
         title: 'Meeting Note',
-    });
+    };
+    console.log('[createMeetingOverlayWindow] BrowserWindow options:', overlayWindowOptions);
+    const overlayWindow = new BrowserWindow(overlayWindowOptions);
     // Pass data via query params
     const params = new URLSearchParams({
         company,
@@ -290,9 +243,24 @@ function createMeetingOverlayWindow({ company, template, content }) {
     return overlayWindow;
 }
 
+ipcMain.handle('minimize-window', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (win) win.minimize();
+});
+
+ipcMain.handle('maximize-window', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (win) {
+        if (win.isMaximized()) {
+            win.unmaximize();
+        } else {
+            win.maximize();
+        }
+    }
+});
+
 module.exports = {
     showLoginWindow,
-    ensureRecordingWindow,
     toggleSettingsPanel,
     createSettingsWindow,
     hideSettingsWindow,

@@ -6,13 +6,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>New Meeting</title>
   <link href="https://cdn.quilljs.com/1.3.6/quill.bubble.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/lucide-static@0.343.0/font/lucide.css" rel="stylesheet">
   <style>
     body {
       margin: 0;
       padding: 0;
       background: #FAFBFB;
       font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      min-width: 480px;
+      min-width: 960px;
       min-height: 420px;
       overflow: hidden;
     }
@@ -94,7 +95,6 @@
       color: #333;
     }
     .form-row select {
-      flex: 1;
       padding: 8px 12px;
       border-radius: 6px;
       border: 1px solid #ccc;
@@ -114,8 +114,7 @@
       box-shadow: 0 0 0 2px rgba(27,27,27,0.1);
     }
     .create-btn {
-      width: 100%;
-      padding: 10px 0;
+      padding: 10px 20px;
       border-radius: 6px;
       background: #1B1B1B;
       color: #fff;
@@ -125,6 +124,9 @@
       cursor: pointer;
       transition: all 0.2s ease;
       margin-top: 16px;
+      display: block;
+      margin-left: auto;
+      margin-right: auto;
     }
     .create-btn:hover {
       background: #333;
@@ -447,107 +449,620 @@
       color: #aaa;
       cursor: not-allowed;
     }
+    .sidebar-btn {
+      background: none;
+      border: none;
+      outline: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0;
+      padding: 0;
+      width: 40px;
+      height: 40px;
+      margin-bottom: 10px;
+    }
+    .sidebar-icon-wrapper {
+      background: #232323;
+      border-radius: 60px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      transition: background 0.15s;
+    }
+    .sidebar-btn:focus .sidebar-icon-wrapper,
+    .sidebar-btn:hover .sidebar-icon-wrapper {
+      background: #333;
+    }
+    .sidebar-btn i[data-lucide] {
+      display: block;
+    }
+    .sidebar-btn svg {
+      stroke: #FFFFFF !important;
+      width: 14px !important;
+      height: 14px !important;
+      display: block;
+    }
+    .sidebar-tooltip {
+      visibility: hidden;
+      opacity: 0;
+      background: #222;
+      color: #fff;
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      position: absolute;
+      left: 48px;
+      top: 50%;
+      transform: translateY(-50%);
+      white-space: nowrap;
+      z-index: 200;
+      pointer-events: none;
+      transition: opacity 0.15s, visibility 0.15s;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+    }
+    .sidebar-btn:focus .sidebar-tooltip,
+    .sidebar-btn:hover .sidebar-tooltip {
+      visibility: visible;
+      opacity: 1;
+    }
+    .sidebar-btn {
+      position: relative;
+    }
+    #editTab {
+      position: relative;
+      min-height: 300px;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+    }
+    #quillEditor {
+      flex: 1 1 auto;
+    }
+    #recordBar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      height: 48px;
+      width: 20%;
+      min-width: 180px;
+      padding: 0 16px;
+      border-radius: 24px;
+      background: #1B1B1B;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.13);
+      border: 1.5px solid #232323;
+      position: fixed;
+      left: 50%;
+      transform: translateX(-50%);
+      bottom: 20px;
+      z-index: 1001;
+    }
+    #recordBar #waveform {
+      height: 24px;
+      min-width: 50px;
+      display: flex;
+      align-items: flex-end;
+      gap: 3px;
+    }
+    #recordBar #waveform div {
+      background-color: #22C55E;
+      border-radius: 2px;
+      width: 4px !important;
+      min-height: 3px !important;
+      max-height: 20px !important;
+      height: 10px !important;
+      transition: height 0.1s ease-out;
+    }
+    #recordBar .chevron-icon-container i[data-lucide] {
+      stroke: #A0A0A0;
+      width: 18px;
+      height: 18px;
+      display: block;
+    }
+    #recordBar .record-btn {
+      background: transparent !important;
+      border: none !important;
+      padding: 0 !important;
+      margin: 0 !important;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      line-height: 1;
+    }
+    #recordBar .record-btn i[data-lucide] {
+      width: 22px !important;
+      height: 22px !important;
+      stroke: #D1D5DB !important;
+      fill: #D1D5DB !important;
+      display: block;
+    }
+    #recordBar #timer {
+      display: none;
+      font-size: 13px;
+      color: #ccc;
+      min-width: 40px;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+    #mainContentWrapper {
+      margin-left: 56px;
+      height: calc(100vh - 40px);
+      width: calc(100vw - 56px);
+      padding: 0;
+      box-sizing: border-box;
+      min-width: 960px;
+    }
+    #meetingContent {
+      height: 100%;
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    #editTab.tab-content.active {
+      position: relative;
+      height: 100vh;
+      width: 100vw;
+      min-height: 0;
+      min-width: 960px;
+      padding: 0;
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      background: #fff;
+      box-sizing: border-box;
+    }
+    #quillEditor {
+      height: 100vh;
+      min-height: 0;
+      width: 100vw;
+      margin: 0;
+      background: #fff !important;
+      border-radius: 0 !important;
+      box-shadow: none !important;
+      padding: 0 !important;
+      border: none !important;
+      flex: 1 1 auto;
+      position: relative;
+      z-index: 1;
+    }
+    #sidebarOverlay {
+      display: none;
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(250,251,251,0.96);
+      z-index: 2000;
+      align-items: flex-start;
+      justify-content: center;
+    }
+    #sidebarOverlayContent {
+      width: 100%;
+      height: 100%;
+      max-width: none;
+      max-height: none;
+      min-width: 0;
+      min-height: 0;
+      border-radius: 0;
+      background: #fff;
+      color: #222;
+      box-shadow: none;
+      padding: 32px;
+      position: relative;
+      overflow: auto;
+      box-sizing: border-box;
+      margin: 0;
+      left: 0;
+      right: 0;
+      top: 0;
+      bottom: 0;
+      display: flex;
+      flex-direction: column;
+    }
+    @media (max-width: 600px) {
+      #sidebarOverlayContent {
+        padding: 12px 4px;
+      }
+    }
+    /* Added styles for the meeting setup container */
+    .meeting-setup-content {
+      max-width: 400px;
+      margin: 0 auto;
+    }
   </style>
 </head>
 <body>
-  <div class="title-bar" id="titleBar" style="display:none;">
-    <div id="meetingTitle" contenteditable="true">Meeting <span id="companyLabel">[company]</span> for a <span id="templateLabel">[template]</span></div>
-    <button class="close-btn" id="closeBtn">×</button>
-  </div>
-  <div id="meetingSetup" style="padding:32px 24px 0 24px;">
-    <div class="form-row">
-      <label for="companySelect">Company</label>
-      <select id="companySelect"></select>
+  <!-- Custom Title Bar (moved to top) -->
+  <div class="custom-titlebar" style="-webkit-app-region: drag; display: flex; align-items: center; height: 32px; background: #000; border-radius: 0 0 8px 0; border-bottom: 1px solid #222; box-shadow: 0 2px 8px rgba(0,0,0,0.18); padding: 0 12px 0 64px; position: relative; z-index: 101;">
+    <div id="windowControls" style="display: flex; align-items: center; gap: 8px; position: absolute; left: 12px; top: 0; height: 100%;">
+      <button id="windowCloseBtn" class="window-control" aria-label="Close" style="-webkit-app-region: no-drag; width: 14px; height: 14px; border-radius: 50%; background: #ff5f56; border: none; margin-right: 4px; display: flex; align-items: center; justify-content: center; padding: 0; cursor: pointer;"><svg width="8" height="8" viewBox="0 0 8 8"><line x1="1" y1="1" x2="7" y2="7" stroke="#fff" stroke-width="1.2"/><line x1="7" y1="1" x2="1" y2="7" stroke="#fff" stroke-width="1.2"/></svg></button>
+      <button id="windowMinBtn" class="window-control" aria-label="Minimize" style="-webkit-app-region: no-drag; width: 14px; height: 14px; border-radius: 50%; background: #ffbd2e; border: none; margin-right: 4px; display: flex; align-items: center; justify-content: center; padding: 0; cursor: pointer;"><svg width="8" height="8" viewBox="0 0 8 8"><rect x="1.5" y="3.5" width="5" height="1" rx="0.5" fill="#fff"/></svg></button>
+      <button id="windowMaxBtn" class="window-control" aria-label="Maximize" style="-webkit-app-region: no-drag; width: 14px; height: 14px; border-radius: 50%; background: #27c93f; border: none; display: flex; align-items: center; justify-content: center; padding: 0; cursor: pointer;"><svg width="8" height="8" viewBox="0 0 8 8"><rect x="1.5" y="1.5" width="5" height="5" rx="1" fill="none" stroke="#fff" stroke-width="1.2"/></svg></button>
     </div>
-    <div class="form-row">
-      <label for="templateSelect">Template</label>
-      <select id="templateSelect"></select>
+    <div id="customMeetingTitle" style="-webkit-app-region: no-drag; font-size: 15px; font-weight: 500; color: #fff; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center; letter-spacing: 0.01em;">
+      New Meeting
     </div>
-    <button id="startMeetingBtn" class="create-btn">Create Meeting</button>
-  </div>
-  
-  <div id="meetingContent" style="display:none;">
-    <!-- Tabs navigation -->
-    <div class="tabs-container">
-      <button class="tab" data-tab="recap">Recap</button>
-      <button class="tab" data-tab="outline">Outline</button>
-      <button class="tab active" data-tab="edit">Edit</button>
-      <button id="recordBtn" class="record-btn" title="Record Audio">
-        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <rect x="7" y="3" width="6" height="10" rx="3" fill="#fff" stroke="#1B1B1B" stroke-width="1.5"/>
-          <path d="M10 17v-2.5" stroke="#1B1B1B" stroke-width="1.5" stroke-linecap="round"/>
-          <path d="M6 13.5a4 4 0 0 0 8 0" stroke="#1B1B1B" stroke-width="1.5" stroke-linecap="round"/>
-        </svg>
+    <div id="newMeetingBtnContainer" style="-webkit-app-region: no-drag; margin-left: 12px; display: flex; align-items: center;">
+      <button id="newMeetingBtn" aria-label="New Meeting" style="width: 24px; height: 24px; border-radius: 50%; background: #232323; color: #fff; border: none; display: flex; align-items: center; justify-content: center; padding: 0; cursor: pointer; transition: background 0.2s;">
+        <i data-lucide="plus" style="width: 14px; height: 14px;"></i>
       </button>
     </div>
-    
-    <!-- Tab content -->
-    <div id="recapTab" class="tab-content">
-      <div class="company-recap-container" style="padding: 16px 24px; display: none;">
-        <div class="company-info-section">
-          <h3 class="section-title">Company Overview</h3>
-          <div id="companyName" class="company-name"></div>
-          <div id="companySummary" class="company-summary"></div>
+  </div>
+  <!-- Sidebar (now below title bar) -->
+  <div id="sidebar" style="-webkit-app-region: no-drag; position: fixed; left: 0; top: 32px; width: 56px; height: calc(100vh - 32px); background: var(--base-Text-primary, #1B1B1B); display: flex; flex-direction: column; align-items: center; padding-top: 8px; padding-bottom: 8px; z-index: 100;">
+    <button class="sidebar-btn" id="sidebarPrepareBtn" aria-label="Prepare" style="margin-bottom: 16px;">
+      <span class="sidebar-icon-wrapper"><i data-lucide="file-text"></i></span>
+      <span class="sidebar-tooltip">Prepare</span>
+    </button>
+    <button class="sidebar-btn" id="sidebarDiscussBtn" aria-label="Discuss" style="margin-bottom: 16px;">
+      <span class="sidebar-icon-wrapper"><i data-lucide="message-circle"></i></span>
+      <span class="sidebar-tooltip">Discuss</span>
+    </button>
+    <button class="sidebar-btn" id="sidebarFollowupBtn" aria-label="Follow-up" style="margin-bottom: auto;">
+      <span class="sidebar-icon-wrapper"><i data-lucide="check-circle"></i></span>
+      <span class="sidebar-tooltip">Follow-up</span>
+    </button>
+    <div style="margin-top: auto; width: 100%; display: flex; flex-direction: column; align-items: center;">
+      <button class="sidebar-btn" id="sidebarDarkModeBtn" aria-label="Toggle Dark Mode" style="margin-bottom: 12px;">
+        <span class="sidebar-icon-wrapper"><i data-lucide="moon"></i></span>
+        <span class="sidebar-tooltip">Toggle Dark Mode</span>
+      </button>
+      <button class="sidebar-btn" id="sidebarSettingsBtn" aria-label="Settings">
+        <span class="sidebar-icon-wrapper"><i data-lucide="settings"></i></span>
+        <span class="sidebar-tooltip">Settings</span>
+      </button>
+    </div>
+  </div>
+  <!-- Main content wrapper to offset sidebar and titlebar -->
+  <div id="mainContentWrapper" style="margin-left: 56px;">
+    <div id="meetingSetup" style="padding:32px 24px 0 24px;">
+      <div class="meeting-setup-content">
+        <div class="form-row">
+          <label for="companySelect">Company</label>
+          <select id="companySelect"></select>
         </div>
-        <div class="previous-meetings-section" style="margin-top: 20px;">
-          <h3 class="section-title">Previous Meetings</h3>
-          <div id="previousMeetings" class="previous-meetings-list">
-            <p class="no-meetings">No previous meetings found.</p>
+        <div class="form-row">
+          <label for="templateSelect">Template</label>
+          <select id="templateSelect"></select>
+        </div>
+        <button id="startMeetingBtn" class="create-btn">Create Meeting</button>
+      </div>
+    </div>
+    
+    <div id="meetingContent" style="display:none;">
+      <!-- Tab content -->
+      <div id="recapTab" class="tab-content">
+        <div class="company-recap-container" style="padding: 16px 24px; display: none;">
+          <div class="company-info-section">
+            <h3 class="section-title">Company Overview</h3>
+            <div id="companyName" class="company-name"></div>
+            <div id="companySummary" class="company-summary"></div>
+          </div>
+          <div class="previous-meetings-section" style="margin-top: 20px;">
+            <h3 class="section-title">Previous Meetings</h3>
+            <div id="previousMeetings" class="previous-meetings-list">
+              <p class="no-meetings">No previous meetings found.</p>
+            </div>
+          </div>
+        </div>
+        <div id="recapEmptyState" class="empty-tab-content">
+          <h3>Meeting Preparation</h3>
+          <p>Select a company to view its summary and prepare for your meeting.</p>
+        </div>
+      </div>
+      
+      <div id="outlineTab" class="tab-content">
+        <div class="outline-section-container">
+          <!-- Agenda and open questions will be rendered here by JS -->
+        </div>
+        <div class="empty-tab-content">
+          <h3>Agenda</h3>
+          <p>Agenda and open questions</p>
+        </div>
+      </div>
+      
+      <div id="editTab" class="tab-content active" style="position: relative;">
+        <div id="quillEditor"></div>
+        <div id="recordBar">
+          <div id="waveform">
+            {/* Static waveform bars for styling preview - remove when JS is active */}
+            <div style="height: 12px !important;"></div>
+            <div style="height: 18px !important;"></div>
+            <div style="height: 10px !important;"></div>
+            <div style="height: 15px !important;"></div>
+            <div style="height: 8px !important;"></div>
+          </div>
+          <span class="chevron-icon-container">
+            <i data-lucide="chevron-up"></i>
+          </span>
+          <button id="recordBtn" class="record-btn" title="Stop Recording">
+            <i data-lucide="square"></i>
+          </button>
+          <span id="timer">00:00</span>
+        </div>
+        <!-- Overlay for sidebar content -->
+        <div id="sidebarOverlay" style="display:none; position:absolute; top:0; left:0; width:100%; height:100%; background:rgba(250,251,251,0.96); z-index:2000; align-items: flex-start; justify-content: center;">
+          <div id="sidebarOverlayContent" style="margin: 0 auto; background: #fff; color: #222; border-radius: 12px; min-width: 340px; max-width: 520px; min-height: 180px; max-height: 80vh; box-shadow: 0 4px 32px rgba(0,0,0,0.10); padding: 32px 32px 24px 32px; position: relative; overflow-y: auto;">
+            <button id="sidebarOverlayClose" style="position: absolute; top: 16px; right: 16px; background: none; border: none; color: #888; font-size: 22px; cursor: pointer; opacity: 0.7;">&times;</button>
+            <!-- Content will be injected here -->
+            <div id="sidebarOverlayInner"></div>
           </div>
         </div>
       </div>
-      <div id="recapEmptyState" class="empty-tab-content">
-        <h3>Meeting Preparation</h3>
-        <p>Select a company to view its summary and prepare for your meeting.</p>
-      </div>
     </div>
     
-    <div id="outlineTab" class="tab-content">
-      <div class="outline-section-container">
-        <!-- Agenda and open questions will be rendered here by JS -->
-      </div>
-      <div class="empty-tab-content">
-        <h3>Agenda</h3>
-        <p>Agenda and open questions</p>
-      </div>
+    <!-- Floating Format Bar -->
+    <div id="formatBar">
+      <button class="format-btn" data-format="bold"><strong>B</strong></button>
+      <button class="format-btn" data-format="italic"><em>I</em></button>
+      <div class="divider"></div>
+      <button class="format-btn" data-format="header" data-value="2">H<sub>2</sub></button>
+      <button class="format-btn" data-format="header" data-value="3">H<sub>3</sub></button>
+      <div class="divider"></div>
+      <button class="format-btn" data-format="list" data-value="ordered">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="8" y1="6" x2="21" y2="6"></line>
+          <line x1="8" y1="12" x2="21" y2="12"></line>
+          <line x1="8" y1="18" x2="21" y2="18"></line>
+          <line x1="3" y1="6" x2="3" y2="6"></line>
+          <line x1="3" y1="12" x2="3" y2="12"></line>
+          <line x1="3" y1="18" x2="3" y2="18"></line>
+        </svg>
+      </button>
+      <button class="format-btn" data-format="list" data-value="bullet">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="8" y1="6" x2="21" y2="6"></line>
+          <line x1="8" y1="12" x2="21" y2="12"></line>
+          <line x1="8" y1="18" x2="21" y2="18"></line>
+          <circle cx="3" cy="6" r="1"></circle>
+          <circle cx="3" cy="12" r="1"></circle>
+          <circle cx="3" cy="18" r="1"></circle>
+        </svg>
+      </button>
     </div>
-    
-    <div id="editTab" class="tab-content active">
-      <div id="quillEditor"></div>
-    </div>
-  </div>
-  
-  <!-- Floating Format Bar -->
-  <div id="formatBar">
-    <button class="format-btn" data-format="bold"><strong>B</strong></button>
-    <button class="format-btn" data-format="italic"><em>I</em></button>
-    <div class="divider"></div>
-    <button class="format-btn" data-format="header" data-value="2">H<sub>2</sub></button>
-    <button class="format-btn" data-format="header" data-value="3">H<sub>3</sub></button>
-    <div class="divider"></div>
-    <button class="format-btn" data-format="list" data-value="ordered">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <line x1="8" y1="6" x2="21" y2="6"></line>
-        <line x1="8" y1="12" x2="21" y2="12"></line>
-        <line x1="8" y1="18" x2="21" y2="18"></line>
-        <line x1="3" y1="6" x2="3" y2="6"></line>
-        <line x1="3" y1="12" x2="3" y2="12"></line>
-        <line x1="3" y1="18" x2="3" y2="18"></line>
-      </svg>
-    </button>
-    <button class="format-btn" data-format="list" data-value="bullet">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <line x1="8" y1="6" x2="21" y2="6"></line>
-        <line x1="8" y1="12" x2="21" y2="12"></line>
-        <line x1="8" y1="18" x2="21" y2="18"></line>
-        <circle cx="3" cy="6" r="1"></circle>
-        <circle cx="3" cy="12" r="1"></circle>
-        <circle cx="3" cy="18" r="1"></circle>
-      </svg>
-    </button>
   </div>
   
   <script src="https://cdn.quilljs.com/1.3.6/quill.min.js"></script>
   <script src="meetingOverlay.js"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <script>lucide.createIcons();
+    // Make meeting title editable on click (ensure DOM is loaded)
+    document.addEventListener('DOMContentLoaded', function() {
+      const meetingTitleDiv = document.getElementById('customMeetingTitle');
+      if (!meetingTitleDiv) {
+        console.log('customMeetingTitle not found');
+        return;
+      }
+      let originalTitle = meetingTitleDiv.textContent.trim();
+      meetingTitleDiv.style.cursor = 'pointer';
+      meetingTitleDiv.title = 'Click to edit title';
+      meetingTitleDiv.addEventListener('click', function handleTitleClick(e) {
+        if (meetingTitleDiv.querySelector('input')) return; // Already editing
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.value = originalTitle;
+        input.style.maxWidth = '400px';
+        input.style.minWidth = '200px';
+        input.style.width = 'auto';
+        input.style.fontSize = '15px';
+        input.style.fontWeight = '500';
+        input.style.color = '#fff';
+        input.style.background = '#000';
+        input.style.border = 'none';
+        input.style.borderBottom = '1.5px solid #444';
+        input.style.borderRadius = '0';
+        input.style.padding = '2px 6px';
+        input.style.textAlign = 'center';
+        input.style.outline = 'none';
+        input.style.margin = '0 auto';
+        input.style.display = 'block';
+        input.style.transition = 'border-bottom-color 0.2s';
+        input.setAttribute('aria-label', 'Edit meeting title');
+        meetingTitleDiv.textContent = '';
+        meetingTitleDiv.appendChild(input);
+        input.focus();
+        input.select();
+        // Focus style: brighter underline
+        input.addEventListener('focus', function() {
+          input.style.borderBottom = '1.5px solid #fff';
+        });
+        input.addEventListener('blur', function() {
+          input.style.borderBottom = '1.5px solid #444';
+        });
+        function finishEdit(save) {
+          if (save) {
+            originalTitle = input.value.trim() || 'New Meeting';
+          }
+          meetingTitleDiv.textContent = originalTitle;
+        }
+        input.addEventListener('keydown', function(ev) {
+          if (ev.key === 'Enter') {
+            finishEdit(true);
+          } else if (ev.key === 'Escape') {
+            finishEdit(false);
+          }
+        });
+        input.addEventListener('blur', function() {
+          finishEdit(true);
+        });
+      });
+      console.log('customMeetingTitle edit handler attached');
+    });
+
+    // Overlay logic for sidebar buttons
+    let currentOverlayType = null;
+    function showSidebarOverlay(contentHtml, type) {
+      const overlay = document.getElementById('sidebarOverlay');
+      const inner = document.getElementById('sidebarOverlayInner');
+      if (overlay && inner) {
+        inner.innerHTML = contentHtml;
+        overlay.style.display = 'flex';
+        overlay.setAttribute('data-overlay-type', type);
+        currentOverlayType = type;
+      }
+    }
+    function closeSidebarOverlay() {
+      const overlay = document.getElementById('sidebarOverlay');
+      if (overlay) {
+        overlay.style.display = 'none';
+        overlay.removeAttribute('data-overlay-type');
+        currentOverlayType = null;
+    }
+    }
+    document.getElementById('sidebarOverlayClose').addEventListener('click', closeSidebarOverlay);
+
+    // Helper to toggle overlays
+    function toggleSidebarOverlay(type, contentHtml) {
+      const overlay = document.getElementById('sidebarOverlay');
+      if (overlay && overlay.style.display === 'flex' && currentOverlayType === type) {
+        closeSidebarOverlay();
+      } else {
+        showSidebarOverlay(contentHtml, type);
+      }
+    }
+
+    // Prepare button: show company recap overlay
+    const prepareBtn = document.getElementById('sidebarPrepareBtn');
+    if (prepareBtn) {
+      prepareBtn.addEventListener('click', function() {
+        const companyName = document.getElementById('companyName')?.outerHTML || '';
+        const companySummary = document.getElementById('companySummary')?.outerHTML || '';
+        const previousMeetings = document.getElementById('previousMeetings')?.outerHTML || '';
+        const contentHtml = `
+          <div class="company-info-section">
+            <h3 class="section-title">Company Overview</h3>
+            ${companyName}
+            ${companySummary}
+          </div>
+          <div class="previous-meetings-section" style="margin-top: 20px;">
+            <h3 class="section-title">Previous Meetings</h3>
+            <div class="previous-meetings-list">${previousMeetings}</div>
+          </div>
+        `;
+        toggleSidebarOverlay('prepare', contentHtml);
+      });
+    }
+
+    // Discuss button: show agenda/outline overlay
+    const discussBtn = document.getElementById('sidebarDiscussBtn');
+    if (discussBtn) {
+      discussBtn.addEventListener('click', function() {
+        const outlineSection = document.querySelector('.outline-section-container')?.outerHTML || '';
+        toggleSidebarOverlay('discuss', outlineSection);
+      });
+    }
+
+    // Follow-up button: show agenda/outline overlay (same as Discuss for now)
+    const followupBtn = document.getElementById('sidebarFollowupBtn');
+    if (followupBtn) {
+      followupBtn.addEventListener('click', function() {
+        const outlineSection = document.querySelector('.outline-section-container')?.outerHTML || '';
+        toggleSidebarOverlay('followup', outlineSection);
+      });
+    }
+
+    // Dark Mode button: toggle dark mode
+    const darkModeBtn = document.getElementById('sidebarDarkModeBtn');
+    if (darkModeBtn) {
+      darkModeBtn.addEventListener('click', function() {
+        document.body.classList.toggle('dark-mode');
+      });
+    }
+
+    // Settings button: show settings panel or alert
+    const settingsBtn = document.getElementById('sidebarSettingsBtn');
+    if (settingsBtn) {
+      settingsBtn.addEventListener('click', function() {
+        // If you have a settings panel, show it here. For now, show alert.
+        alert('Settings panel coming soon!');
+      });
+    }
+
+    // Optional: Add dark mode styles
+    const darkModeStyle = document.createElement('style');
+    darkModeStyle.textContent = `
+      body.dark-mode {
+        background: #18181b !important;
+        color: #f3f3f3 !important;
+      }
+      body.dark-mode .custom-titlebar {
+        background: #18181b !important;
+        color: #fff !important;
+      }
+      body.dark-mode #sidebar {
+        background: #232323 !important;
+      }
+      body.dark-mode .tab-content,
+      body.dark-mode .company-recap-container,
+      body.dark-mode .outline-section-container {
+        background: #232323 !important;
+        color: #f3f3f3 !important;
+      }
+      body.dark-mode .record-btn {
+        background: #333 !important;
+        color: #fff !important;
+      }
+      body.dark-mode .record-btn:hover {
+        background: #444 !important;
+      }
+      body.dark-mode input[type="text"] {
+        background: #232323 !important;
+        color: #fff !important;
+        border-bottom: 1.5px solid #888 !important;
+      }
+      body.dark-mode input[type="text"]:focus {
+        border-bottom: 1.5px solid #fff !important;
+      }
+    `;
+    document.head.appendChild(darkModeStyle);
+  </script>
+
+  <script>
+    // Dynamic Waveform Generation
+    document.addEventListener('DOMContentLoaded', function() {
+      const waveformContainer = document.getElementById('waveform');
+      if (!waveformContainer) {
+        console.error('Waveform container not found!');
+        return;
+      }
+
+      const numBars = 15; // Number of bars in the waveform
+      const maxBarHeight = 20; // Corresponds to max-height in CSS (px)
+      const minBarHeight = 3;  // Corresponds to min-height in CSS (px)
+
+      // Clear any static bars first
+      waveformContainer.innerHTML = ''; 
+
+      // Create bars once
+      for (let i = 0; i < numBars; i++) {
+        const bar = document.createElement('div');
+        // CSS will style width, background-color, border-radius
+        waveformContainer.appendChild(bar);
+      }
+
+      // Function to update bar heights
+      function updateWaveform() {
+        const bars = waveformContainer.children;
+        for (let i = 0; i < bars.length; i++) {
+          const randomHeight = Math.floor(Math.random() * (maxBarHeight - minBarHeight + 1)) + minBarHeight;
+          bars[i].style.height = randomHeight + 'px';
+        }
+      }
+
+      // Initial waveform draw
+      updateWaveform();
+
+      // Simulate live waveform by updating heights periodically
+      // Replace this with actual audio processing logic
+      setInterval(updateWaveform, 150); // Update every 150ms
+    });
+  </script>
 </body>
 </html> 

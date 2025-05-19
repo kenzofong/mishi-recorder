@@ -1064,43 +1064,29 @@ authEvents.on('initialSessionChecked', () => {
 // Remove previous dockbar-hover and dockbar-leave handlers
 // Add dockbar-click handler
 ipcMain.on('dockbar-click', () => {
-    // Open/focus the floating bar (recording window) first
-    function openMeetingOverlayAfterBar() {
-        if (global.meetingOverlayWindow && !global.meetingOverlayWindow.isDestroyed()) {
-            global.meetingOverlayWindow.focus();
-            return;
-        }
-        if (windowManager && windowManager.createMeetingOverlayWindow) {
-            global.meetingOverlayWindow = windowManager.createMeetingOverlayWindow({ company: '', template: '', content: '' });
-            if (global.meetingOverlayWindow) {
-                global.meetingOverlayWindow.on('closed', () => {
-                    global.meetingOverlayWindow = null;
-                });
-            }
-        }
+    // Open/focus the meeting overlay window anchored to the dock bar
+    if (global.meetingOverlayWindow && !global.meetingOverlayWindow.isDestroyed()) {
+        global.meetingOverlayWindow.focus();
+        return;
     }
-
-    if (windowManager && windowManager.ensureRecordingWindow) {
-        global.recordingWindow = windowManager.ensureRecordingWindow({
-            preloadPath: path.join(__dirname, 'preload.js'),
-            recordingHtmlPath: path.join(__dirname, 'recordingWindow.html'),
-            state: getState(),
-            onClose: () => { global.recordingWindow = null; }
-        });
-        if (global.recordingWindow && !global.recordingWindow.isDestroyed()) {
-            global.recordingWindow.show();
-            global.recordingWindow.focus();
-            global.recordingWindow.webContents.send('recording-state-change', getState().isRecording);
-            // Wait for the bar to be ready before opening overlay
-            if (global.recordingWindow.isVisible()) {
-                openMeetingOverlayAfterBar();
-            } else {
-                global.recordingWindow.once('show', openMeetingOverlayAfterBar);
-            }
+    if (windowManager && windowManager.createMeetingOverlayWindow) {
+        // Try to anchor to dock bar if available
+        let dockBarWindow = global.dockBarWindow && !global.dockBarWindow.isDestroyed() ? global.dockBarWindow : null;
+        let barBounds = null;
+        if (dockBarWindow) {
+            barBounds = dockBarWindow.getBounds();
         }
-    } else {
-        // Fallback: just open overlay
-        openMeetingOverlayAfterBar();
+        global.meetingOverlayWindow = windowManager.createMeetingOverlayWindow({
+            company: '',
+            template: '',
+            content: '',
+            barBounds // pass barBounds for anchoring if needed
+        });
+        if (global.meetingOverlayWindow) {
+            global.meetingOverlayWindow.on('closed', () => {
+                global.meetingOverlayWindow = null;
+            });
+        }
     }
 });
 

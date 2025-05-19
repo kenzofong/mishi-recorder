@@ -29,6 +29,16 @@ window.addEventListener('DOMContentLoaded', () => {
   // Outline tab elements
   const outlineTabContent = document.getElementById('outlineTab');
 
+  // --- Custom Title Bar Elements ---
+  const customTitleBar = document.querySelector('.custom-titlebar');
+  const customMeetingTitle = document.getElementById('customMeetingTitle');
+  const customCompanyLabel = document.getElementById('customCompanyLabel');
+  const customTemplateLabel = document.getElementById('customTemplateLabel');
+  const newMeetingBtn = document.getElementById('newMeetingBtn');
+  const windowCloseBtn = document.getElementById('windowCloseBtn');
+  const windowMinBtn = document.getElementById('windowMinBtn');
+  const windowMaxBtn = document.getElementById('windowMaxBtn');
+
   let templatesMap = {};
   let quill = null;
   let selectedCompanyId = null;
@@ -400,147 +410,159 @@ window.addEventListener('DOMContentLoaded', () => {
       if (tab.getAttribute('data-tab') === 'outline') {
         renderOutlineTab();
       }
+
+      if (typeof updateRecordBarVisibility === 'function') updateRecordBarVisibility();
     });
   });
 
   // Track the current meeting ID when a meeting is created
-  startMeetingBtn.addEventListener('click', async () => {
-    const companyId = companySelect.value;
-    const templateId = templateSelect.value;
-    
-    if (!companyId || !templateId) {
-      console.warn('[meetingOverlay.js] Missing company or template selection');
-      return;
-    }
-    
-    // Set title bar
-    const companyName = companySelect.options[companySelect.selectedIndex]?.textContent || '[company]';
-    const templateName = templateSelect.options[templateSelect.selectedIndex]?.textContent || '[template]';
-    companyLabel.textContent = companyName;
-    templateLabel.textContent = templateName;
-    
-    // Get template content
-    const templateContent = templatesMap[templateId]?.content || '';
-    console.log('[meetingOverlay.js] Selected template:', {
-      id: templateId,
-      name: templateName,
-      hasContent: !!templateContent,
-      contentLength: templateContent.length
-    });
-    
-    let meetingId = null;
-    try {
-      // Make the meeting title unique by appending date, time (with seconds), and a random code
-      const now = new Date();
-      const dateStr = now.toLocaleDateString('en-CA'); // YYYY-MM-DD
-      const timeStr = now.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' }); // HH:MM:SS
-      const randomCode = Math.floor(1000 + Math.random() * 9000); // 4-digit random
-      const uniqueTitle = `${companyName} Meeting - ${dateStr} ${timeStr} #${randomCode}`;
-      const res = await ipcRenderer.invoke('create-meeting', {
-        title: uniqueTitle,
-        companyId
-      });
-      if (res.success && res.meeting && res.meeting.id) {
-        meetingId = res.meeting.id;
-        currentMeetingId = meetingId;
-        console.log('[meetingOverlay.js] Created meeting with ID:', meetingId);
-      } else {
-        alert('Failed to create meeting: ' + (res.error || 'Unknown error'));
+  if (startMeetingBtn) {
+    startMeetingBtn.addEventListener('click', async () => {
+      const companyId = companySelect.value;
+      const templateId = templateSelect.value;
+      
+      if (!companyId || !templateId) {
+        console.warn('[meetingOverlay.js] Missing company or template selection');
         return;
       }
-    } catch (err) {
-      alert('Error creating meeting: ' + err.message);
-      return;
-    }
-
-    // Show the meeting panel immediately (optimistic UI)
-    titleBar.style.display = '';
-    meetingSetup.style.display = 'none';
-    meetingContent.style.display = 'block';
-
-    // Show loading in outline section
-    const outlineSectionContainer = outlineTabContent.querySelector('.outline-section-container');
-    if (outlineSectionContainer) {
-      outlineSectionContainer.innerHTML = `<div class="empty-tab-content"><p>Generating agenda and open questions...</p></div>`;
-    }
-
-    // Make sure the recap tab has the latest company information
-    console.log('[DEBUG] Ensuring recap tab has latest company information');
-    handleCompanyChange();
-
-    // Switch to the recap tab first to ensure it's populated
-    document.querySelector('[data-tab="recap"]').click();
-    // Then switch to the edit tab
-    setTimeout(() => {
-      document.querySelector('[data-tab="edit"]').click();
-    }, 300);
-
-    // Initialize Quill editor with bubble theme and template content
-    setTimeout(() => {
+      
+      // Set title bar
+      const companyName = companySelect.options[companySelect.selectedIndex]?.textContent || '[company]';
+      const templateName = templateSelect.options[templateSelect.selectedIndex]?.textContent || '[template]';
+      if (typeof companyLabel !== 'undefined' && companyLabel) companyLabel.textContent = companyName;
+      if (typeof templateLabel !== 'undefined' && templateLabel) templateLabel.textContent = templateName;
+      
+      // Get template content
+      const templateContent = templatesMap[templateId]?.content || '';
+      console.log('[meetingOverlay.js] Selected template:', {
+        id: templateId,
+        name: templateName,
+        hasContent: !!templateContent,
+        contentLength: templateContent.length
+      });
+      
+      let meetingId = null;
       try {
-        // Destroy existing quill instance if it exists
-        if (quill) {
-          // No direct destroy method, remove content and handlers
-          quill.setText('');
-          quill = null;
+        // Make the meeting title unique by appending date, time (with seconds), and a random code
+        const now = new Date();
+        const dateStr = now.toLocaleDateString('en-CA'); // YYYY-MM-DD
+        const timeStr = now.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' }); // HH:MM:SS
+        const randomCode = Math.floor(1000 + Math.random() * 9000); // 4-digit random
+        const uniqueTitle = `${companyName} Meeting - ${dateStr} ${timeStr} #${randomCode}`;
+        const res = await ipcRenderer.invoke('create-meeting', {
+          title: uniqueTitle,
+          companyId
+        });
+        if (res.success && res.meeting && res.meeting.id) {
+          meetingId = res.meeting.id;
+          currentMeetingId = meetingId;
+          console.log('[meetingOverlay.js] Created meeting with ID:', meetingId);
+        } else {
+          alert('Failed to create meeting: ' + (res.error || 'Unknown error'));
+          return;
         }
-        // Create a fresh Quill instance with bubble theme
-        quill = new window.Quill('#quillEditor', {
-          theme: 'bubble', // Use bubble theme instead of snow
-          placeholder: 'Meeting notes...',
-          formats: ['bold', 'italic', 'header', 'list', 'link'],
-          modules: {
-            toolbar: false // Disable default toolbar
-          }
-        });
-        // Handle selection change to show/hide and position format bar
-        quill.on('selection-change', function(range, oldRange, source) {
-          if (range && range.length > 0) {
-            // Text is selected, position and show format bar
-            const bounds = quill.getBounds(range.index, range.length);
-            showFormatBar(bounds);
-            updateFormatButtons(quill, range);
-          } else {
-            // No selection, hide format bar
-            hideFormatBar();
-          }
-        });
-        // Wait for Quill to be fully initialized before setting content
-        setTimeout(() => {
-          try {
-            // Set content safely using Quill's proper methods
-            if (templateContent) {
-              // Use pasteHTML for HTML content
-              if (templateContent.trim().startsWith('<')) {
-                // First clear any existing content
-                quill.setText('');
-                // Insert HTML content
-                quill.clipboard.dangerouslyPasteHTML(0, templateContent);
-              } else {
-                quill.setText(templateContent);
-              }
-            }
-            console.log('[meetingOverlay.js] Successfully set template content in Quill editor');
-          } catch (err) {
-            console.error('[meetingOverlay.js] Error setting template content:', err);
-          }
-        }, 100);
       } catch (err) {
-        console.error('[meetingOverlay.js] Error initializing Quill:', err);
+        alert('Error creating meeting: ' + err.message);
+        return;
       }
-    }, 400);
 
-    // Start generating meeting prep, but don't block UI
-    ipcRenderer.invoke('generate-meeting-prep', meetingId).then(prepRes => {
-      // When ready, re-render the outline tab
-      renderOutlineTab();
-    }).catch(err => {
+      // Show the meeting panel immediately (optimistic UI)
+      meetingSetup.style.display = 'none';
+      meetingContent.style.display = 'block';
+
+      // Show loading in outline section
       const outlineSectionContainer = outlineTabContent.querySelector('.outline-section-container');
       if (outlineSectionContainer) {
-        outlineSectionContainer.innerHTML = `<div class=\"empty-tab-content\"><p>Failed to generate agenda: ${err.message}</p></div>`;
+        outlineSectionContainer.innerHTML = `<div class="empty-tab-content"><p>Generating agenda and open questions...</p></div>`;
       }
+
+      // Make sure the recap tab has the latest company information
+      console.log('[DEBUG] Ensuring recap tab has latest company information');
+      handleCompanyChange();
+
+      // Switch to the recap tab first to ensure it's populated
+      const recapTabBtn = document.querySelector('[data-tab="recap"]');
+      if (recapTabBtn) recapTabBtn.click();
+      // Then switch to the edit tab
+      setTimeout(() => {
+        const editTabBtn = document.querySelector('[data-tab="edit"]');
+        if (editTabBtn) editTabBtn.click();
+      }, 300);
+
+      // Initialize Quill editor with bubble theme and template content
+      setTimeout(() => {
+        try {
+          // Destroy existing quill instance if it exists
+          if (quill) {
+            // No direct destroy method, remove content and handlers
+            quill.setText('');
+            quill = null;
+          }
+          // Create a fresh Quill instance with bubble theme
+          quill = new window.Quill('#quillEditor', {
+            theme: 'bubble', // Use bubble theme instead of snow
+            placeholder: 'Meeting notes...',
+            formats: ['bold', 'italic', 'header', 'list', 'link'],
+            modules: {
+              toolbar: false // Disable default toolbar
+            }
+          });
+          // Handle selection change to show/hide and position format bar
+          quill.on('selection-change', function(range, oldRange, source) {
+            if (range && range.length > 0) {
+              // Text is selected, position and show format bar
+              const bounds = quill.getBounds(range.index, range.length);
+              showFormatBar(bounds);
+              updateFormatButtons(quill, range);
+            } else {
+              // No selection, hide format bar
+              hideFormatBar();
+            }
+          });
+          // Wait for Quill to be fully initialized before setting content
+          setTimeout(() => {
+            try {
+              // Set content safely using Quill's proper methods
+              if (templateContent) {
+                // Use pasteHTML for HTML content
+                if (templateContent.trim().startsWith('<')) {
+                  // First clear any existing content
+                  quill.setText('');
+                  // Insert HTML content
+                  quill.clipboard.dangerouslyPasteHTML(0, templateContent);
+                } else {
+                  quill.setText(templateContent);
+                }
+              }
+              console.log('[meetingOverlay.js] Successfully set template content in Quill editor');
+            } catch (err) {
+              console.error('[meetingOverlay.js] Error setting template content:', err);
+            }
+          }, 100);
+        } catch (err) {
+          console.error('[meetingOverlay.js] Error initializing Quill:', err);
+        }
+      }, 400);
+
+      // Start generating meeting prep, but don't block UI
+      ipcRenderer.invoke('generate-meeting-prep', meetingId).then(prepRes => {
+        // When ready, re-render the outline tab
+        renderOutlineTab();
+      }).catch(err => {
+        const outlineSectionContainer = outlineTabContent.querySelector('.outline-section-container');
+        if (outlineSectionContainer) {
+          outlineSectionContainer.innerHTML = `<div class=\"empty-tab-content\"><p>Failed to generate agenda: ${err.message}</p></div>`;
+        }
+      });
+
+      if (typeof updateRecordBarVisibility === 'function') updateRecordBarVisibility();
+
+      // After successful creation, get selected company/template names
+      const selectedCompanyName = companySelect.options[companySelect.selectedIndex]?.textContent || '';
+      const selectedTemplateName = templateSelect.options[templateSelect.selectedIndex]?.textContent || '';
+      showMeetingContent(selectedCompanyName, selectedTemplateName);
     });
-  });
+  }
 
   // Floating format bar functions
   function showFormatBar(bounds) {
@@ -619,25 +641,38 @@ window.addEventListener('DOMContentLoaded', () => {
   });
 
   // Make title editable
-  meetingTitle.addEventListener('focus', () => {
-    // Store the original content to restore selected spans
-    meetingTitle.dataset.original = meetingTitle.innerHTML;
-  });
-  
-  meetingTitle.addEventListener('blur', () => {
-    // Ensure company and template labels are preserved
-    if (!meetingTitle.textContent.trim()) {
-      meetingTitle.innerHTML = meetingTitle.dataset.original || 'Meeting';
-    } else if (!meetingTitle.contains(companyLabel) || !meetingTitle.contains(templateLabel)) {
-      // If user removed the spans, restore them
-      meetingTitle.innerHTML = `Meeting <span id="companyLabel">${companyLabel.textContent}</span> for a <span id="templateLabel">${templateLabel.textContent}</span>`;
-    }
-  });
+  if (typeof meetingTitle !== 'undefined' && meetingTitle) {
+    meetingTitle.addEventListener('focus', () => {
+      // Store the original content to restore selected spans
+      meetingTitle.dataset.original = meetingTitle.innerHTML;
+    });
+    meetingTitle.addEventListener('blur', () => {
+      // Ensure company and template labels are preserved
+      if (!meetingTitle.textContent.trim()) {
+        meetingTitle.innerHTML = meetingTitle.dataset.original || 'Meeting';
+      } else if ((typeof companyLabel !== 'undefined' && companyLabel && !meetingTitle.contains(companyLabel)) || (typeof templateLabel !== 'undefined' && templateLabel && !meetingTitle.contains(templateLabel))) {
+        // If user removed the spans, restore them
+        meetingTitle.innerHTML = `Meeting <span id="companyLabel">${companyLabel ? companyLabel.textContent : ''}</span> for a <span id="templateLabel">${templateLabel ? templateLabel.textContent : ''}</span>`;
+      }
+    });
+  }
 
-  // Close button
-  closeBtn.addEventListener('click', () => {
-    window.close();
-  });
+  // Wire up window control buttons
+  if (windowCloseBtn) {
+    windowCloseBtn.addEventListener('click', () => {
+      window.close();
+    });
+  }
+  if (windowMinBtn) {
+    windowMinBtn.addEventListener('click', () => {
+      if (ipcRenderer) ipcRenderer.invoke('minimize-window');
+    });
+  }
+  if (windowMaxBtn) {
+    windowMaxBtn.addEventListener('click', () => {
+      if (ipcRenderer) ipcRenderer.invoke('maximize-window');
+    });
+  }
 
   // Handle IPC error events
   ipcRenderer.on('open-meeting-overlay-error', (event, data) => {
@@ -708,7 +743,7 @@ window.addEventListener('DOMContentLoaded', () => {
     // Default: ready to record
     recordBtn.disabled = false;
     recordBtn.classList.remove('recording');
-    recordBtn.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="7" y="3" width="6" height="10" rx="3" fill="#fff" stroke="#1B1B1B" stroke-width="1.5"/><path d="M10 17v-2.5" stroke="#1B1B1B" stroke-width="1.5" stroke-linecap="round"/><path d="M6 13.5a4 4 0 0 0 8 0" stroke="#1B1B1B" stroke-width="1.5" stroke-linecap="round"/></svg>`;
+    recordBtn.innerHTML = `<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='#fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' class='lucide lucide-mic'><path d='M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z'></path><path d='M19 10v2a7 7 0 0 1-14 0v-2'></path><line x1='12' x2='12' y1='19' y2='22'></line></svg>`;
     recordBtn.title = 'Record Audio';
   }
 
@@ -775,20 +810,76 @@ window.addEventListener('DOMContentLoaded', () => {
       try {
         const meetingId = getCurrentMeetingId();
         if (!meetingId) throw new Error('No meeting in progress');
+        
+        // stopRecording (from recording.js, called via ipcHandlers)
+        // now handles the entire lifecycle including initiating transcription.
         await ipcRenderer.invoke('stop-recording-audio');
-        // Trigger transcription edge function
-        const res = await ipcRenderer.invoke('transcribe-meeting-audio', meetingId);
-        if (res.success) {
-          transcriptionReady = true;
-        } else {
-          alert('Transcription failed: ' + (res.error || 'Unknown error'));
-        }
+        console.log('[meetingOverlay.js] stop-recording-audio invoked. Transcription should be initiated by main process.');
+        
+        // The following call is redundant as transcription is handled by the stop-recording-audio flow.
+        // const res = await ipcRenderer.invoke('transcribe-meeting-audio', meetingId);
+        // if (res.success) {
+        //   transcriptionReady = true;
+        // } else {
+        //   alert('Transcription failed: ' + (res.error || 'Unknown error'));
+        // }
+
+        // Assuming transcription status will be updated via other means (e.g., WebSocket, polling if mishiService provides it)
+        // For now, we can remove the direct alert for transcription failure here as it's handled by recording.js
+
       } catch (err) {
-        alert('Error during transcription: ' + err.message);
+        // This error is for the stop-recording-audio invocation itself or meetingId issues.
+        alert('Error stopping recording or initiating transcription: ' + err.message);
       } finally {
-        isTranscribing = false;
+        isTranscribing = false; // This should be set based on actual transcription status updates from main
         updateRecordButton();
       }
     }
+
+    if (typeof updateRecordBarVisibility === 'function') updateRecordBarVisibility();
   });
-}); 
+
+  // --- SIDEBAR BUTTON LOGIC ---
+  const sidebarPrepareBtn = document.getElementById('sidebarPrepareBtn');
+  const sidebarDiscussBtn = document.getElementById('sidebarDiscussBtn');
+  const sidebarFollowupBtn = document.getElementById('sidebarFollowupBtn');
+  const sidebarDarkModeBtn = document.getElementById('sidebarDarkModeBtn');
+  const sidebarSettingsBtn = document.getElementById('sidebarSettingsBtn');
+  const mainContentWrapper = document.getElementById('mainContentWrapper');
+
+  // Helper to show/hide main panels
+  function showMeetingSetup() {
+    meetingSetup.style.display = '';
+    meetingContent.style.display = 'none';
+    updateCustomTitleBar(undefined, undefined, undefined, false);
+    if (typeof updateRecordBarVisibility === 'function') updateRecordBarVisibility();
+  }
+  function showMeetingContent(company, template) {
+    meetingSetup.style.display = 'none';
+    meetingContent.style.display = 'block';
+    updateCustomTitleBar(undefined, company, template, true);
+    if (typeof updateRecordBarVisibility === 'function') updateRecordBarVisibility();
+  }
+});
+
+function updateCustomTitleBar(meetingTitle, company, template, isMeetingCreated) {
+  // Implementation of updateCustomTitleBar function
+}
+
+function updateRecordBarVisibility() {
+  // Implementation of updateRecordBarVisibility function
+}
+
+function showMeetingContent(company, template) {
+  meetingSetup.style.display = 'none';
+  meetingContent.style.display = 'block';
+  updateCustomTitleBar(undefined, company, template, true);
+  if (typeof updateRecordBarVisibility === 'function') updateRecordBarVisibility();
+}
+
+function showMeetingSetup() {
+  meetingSetup.style.display = '';
+  meetingContent.style.display = 'none';
+  updateCustomTitleBar(undefined, undefined, undefined, false);
+  if (typeof updateRecordBarVisibility === 'function') updateRecordBarVisibility();
+}

@@ -463,18 +463,19 @@ function setupIPCHandlers({
     ipcMain.handle('stop-recording-audio', async () => {
         try {
             console.log('[stop-recording-audio] Handler called');
-            await stopRecording();
-            const fs = require('fs');
-            console.log('[stop-recording-audio] tempRecordingPath:', tempRecordingPath);
-            if (!tempRecordingPath || !fs.existsSync(tempRecordingPath)) {
-                console.error('[stop-recording-audio] No audio file found at', tempRecordingPath);
-                return { success: false, error: 'No audio file recorded' };
-            }
-            console.log('[stop-recording-audio] Audio file exists at', tempRecordingPath);
-            return { success: true, filePath: tempRecordingPath };
+            // The stopRecording function from recording.js handles file existence checks,
+            // reading the file for transcription, and cleanup.
+            // If it resolves successfully, the operation was successful from its perspective.
+            await stopRecording(); 
+            
+            // tempRecordingPath is the path that WAS used. It's expected to be cleaned up
+            // by the stopRecording (from recording.js) after initiating transcription.
+            console.log('[stop-recording-audio] stopRecording (from recording.js) completed. Original path was:', tempRecordingPath);
+            return { success: true, filePath: tempRecordingPath }; // Return the path that was used.
         } catch (err) {
-            console.error('[stop-recording-audio] Error:', err);
-            return { success: false, error: err.message };
+            console.error('[stop-recording-audio] Error during stopRecording process:', err);
+            // Ensure tempRecordingPath is included in the error if it exists, for context
+            return { success: false, error: err.message, filePath: tempRecordingPath || 'Unknown' };
         }
     });
 
